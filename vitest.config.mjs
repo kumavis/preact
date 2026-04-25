@@ -50,6 +50,10 @@ const alias = {
 	'^preact/test-utils$': path.join(
 		root,
 		MINIFY ? 'test-utils/dist/testUtils.mjs' : 'test-utils/src/index.js'
+	),
+	'^preact/secure$': path.join(
+		root,
+		MINIFY ? 'secure/dist/secure.mjs' : 'secure/src/index.js'
 	)
 };
 
@@ -114,6 +118,12 @@ const rollupAlias = [
 		replacement: MINIFY
 			? path.join(root, 'test-utils/dist/testUtils.mjs')
 			: path.join(root, 'test-utils/src/index.js')
+	},
+	{
+		find: /^preact\/secure$/,
+		replacement: MINIFY
+			? path.join(root, 'secure/dist/secure.mjs')
+			: path.join(root, 'secure/src/index.js')
 	}
 ];
 
@@ -140,7 +150,7 @@ export default defineConfig({
 		exclude: ['node_nodules'],
 		jsx: 'transform',
 		jsxFactory: 'createElement',
-		jsxFragment: 'Fragment',
+		jsxFragment: 'Fragment'
 	},
 	plugins: [
 		{
@@ -166,7 +176,7 @@ export default defineConfig({
 							}
 						]
 					],
-					include: ['**/src/**/*.js', '**/test/**/*.js', '**/test/**/*.jsx'],
+					include: ['**/src/**/*.js', '**/test/**/*.js', '**/test/**/*.jsx']
 				});
 
 				return {
@@ -191,7 +201,7 @@ export default defineConfig({
 			'react-dom'
 		],
 		esbuildOptions: {
-			alias,
+			alias
 		}
 	},
 	test: {
@@ -234,7 +244,7 @@ export default defineConfig({
 				extends: true,
 				test: {
 					include: [
-						'{debug,devtools,hooks,compat,test-utils,jsx-runtime}/test/{browser,shared}/**/*.test.js?(x)',
+						'{debug,devtools,hooks,compat,test-utils,jsx-runtime,secure}/test/{browser,shared}/**/*.test.js?(x)',
 						'./test/{browser,shared}/**/*.test.js?(x)'
 					],
 					setupFiles: ['./vitest.setup.js'],

@@ -1,0 +1,15 @@
+{
+  "name": "preact-secure",
+  "amdName": "preactSecure",
+  "private": true,
+  "description": "Secure renderer for Preact: components never see DOM nodes or raw events.",
+  "main": "dist/secure.js",
+  "module": "dist/secure.mjs",
+  "umd:main": "dist/secure.umd.js",
+  "source": "src/index.js",
+  "types": "src/index.d.ts",
+  "license": "MIT",
+  "peerDependencies": {
+    "preact": "^11.0.0 || ^10.0.0"
+  }
+}

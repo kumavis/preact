@@ -15,11 +15,6 @@ import { setupScratch, teardown } from '../../../test/_util/helpers';
  * accidentally hold a reference to a real DOM Element.
  */
 
-// Bound the walk so tests run in finite time. The DOM and prototype
-// chain together expose a very large graph; if a leak existed it would
-// almost always sit within a few hops of the surface.
-const WALK_OPTS = { maxDepth: 8 };
-
 function captureFirstHandlerArg(scratch) {
 	let captured;
 	secureRender(
@@ -56,29 +51,27 @@ describe('preact/secure: dom unreachability (lavatube)', () => {
 		// sanity: confirm lavatube *can* find the button when the start
 		// reference actually contains it. Catches misconfiguration where
 		// the negative tests below trivially pass for the wrong reason.
-		expect(lavatube.find({ button }, button, WALK_OPTS)).to.not.equal(
-			undefined
-		);
+		expect(lavatube.find({ button }, button)).to.not.equal(undefined);
 
-		const path = lavatube.find(safe, button, WALK_OPTS);
+		const path = lavatube.find(safe, button);
 		expect(path).to.equal(undefined);
 	});
 
 	it('SafeEvent has no path to document', () => {
 		const safe = captureFirstHandlerArg(scratch);
-		const path = lavatube.find(safe, document, WALK_OPTS);
+		const path = lavatube.find(safe, document);
 		expect(path).to.equal(undefined);
 	});
 
 	it('SafeEvent has no path to window', () => {
 		const safe = captureFirstHandlerArg(scratch);
-		const path = lavatube.find(safe, window, WALK_OPTS);
+		const path = lavatube.find(safe, window);
 		expect(path).to.equal(undefined);
 	});
 
 	it('SafeEvent has no path to the scratch container', () => {
 		const safe = captureFirstHandlerArg(scratch);
-		const path = lavatube.find(safe, scratch, WALK_OPTS);
+		const path = lavatube.find(safe, scratch);
 		expect(path).to.equal(undefined);
 	});
 
@@ -88,17 +81,15 @@ describe('preact/secure: dom unreachability (lavatube)', () => {
 		// the snapshot must not BE the live element
 		expect(safe.target).to.not.equal(button);
 		// and must not lead to it
-		expect(lavatube.find(safe.target, button, WALK_OPTS)).to.equal(undefined);
-		expect(lavatube.find(safe.target, document, WALK_OPTS)).to.equal(undefined);
+		expect(lavatube.find(safe.target, button)).to.equal(undefined);
+		expect(lavatube.find(safe.target, document)).to.equal(undefined);
 	});
 
 	it('SafeEvent.currentTarget snapshot has no path back to the live element', () => {
 		const safe = captureFirstHandlerArg(scratch);
 		const button = scratch.querySelector('button');
 		expect(safe.currentTarget).to.not.equal(button);
-		expect(lavatube.find(safe.currentTarget, button, WALK_OPTS)).to.equal(
-			undefined
-		);
+		expect(lavatube.find(safe.currentTarget, button)).to.equal(undefined);
 	});
 
 	it('SafeEvent does not expose the underlying DOM Event via any field', () => {
@@ -124,7 +115,7 @@ describe('preact/secure: dom unreachability (lavatube)', () => {
 		expect(safe).to.exist;
 		expect(raw).to.exist;
 		expect(safe).to.not.equal(raw);
-		const path = lavatube.find(safe, raw, WALK_OPTS);
+		const path = lavatube.find(safe, raw);
 		expect(path).to.equal(undefined);
 	});
 
@@ -157,7 +148,7 @@ describe('preact/secure: dom unreachability (lavatube)', () => {
 
 		const button = scratch.querySelector('button');
 		expect(captured).to.exist;
-		expect(lavatube.find(captured, button, WALK_OPTS)).to.equal(undefined);
-		expect(lavatube.find(captured, document, WALK_OPTS)).to.equal(undefined);
+		expect(lavatube.find(captured, button)).to.equal(undefined);
+		expect(lavatube.find(captured, document)).to.equal(undefined);
 	});
 });

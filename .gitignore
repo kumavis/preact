@@ -14,4 +14,3 @@ package/
 preact-*.tgz
 preact.tgz
 *.local.*
-test/ses/.preact.bundle.mjs

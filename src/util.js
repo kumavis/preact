@@ -6,12 +6,13 @@ export const assign = Object.assign;
 
 /**
  * Shallow-copy a vnode. Equivalent to `Object.assign({}, vnode)` but safe to
- * call when `Object.prototype.constructor` is non-writable (e.g. SES
- * lockdown or `Object.freeze(Object.prototype)`). Vnodes carry a
- * `constructor: undefined` own property as a JSON-injection guard, and
- * `Object.assign` uses [[Set]] semantics — copying that property to a fresh
- * `{}` walks up to the frozen `Object.prototype.constructor` and throws.
- * Pre-seeding the target with its own `constructor` slot avoids the walk.
+ * call when `Object.prototype.constructor` is non-writable (e.g. under
+ * Hardened JavaScript — see https://hardenedjs.org/ — or simply after
+ * `Object.freeze(Object.prototype)`). Vnodes carry a `constructor: undefined`
+ * own property as a JSON-injection guard, and `Object.assign` uses [[Set]]
+ * semantics — copying that property to a fresh `{}` walks up to the frozen
+ * `Object.prototype.constructor` and throws. Pre-seeding the target with its
+ * own `constructor` slot avoids the walk.
  * @template T
  * @param {T} vnode
  * @returns {T}

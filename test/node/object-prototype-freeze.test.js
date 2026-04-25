@@ -2,10 +2,12 @@ import { expect } from 'chai';
 import { createElement } from '../../src/index';
 import { cloneVNode } from '../../src/util';
 
-// SES `lockdown()` makes `Object.prototype.constructor` non-writable as part
-// of override-mistake taming. The narrowest reproduction is just freezing
+// Under Hardened JavaScript (https://hardenedjs.org/),
+// `Object.prototype.constructor` is non-writable as part of
+// override-mistake taming. The narrowest reproduction is just freezing
 // `Object.prototype` outright — that also makes `constructor` non-writable
-// and triggers the same failure mode without pulling SES into devDeps.
+// and triggers the same failure mode without pulling any extra runtime
+// into devDeps.
 //
 // Run order matters: we freeze AFTER importing so module init can still
 // complete. The freeze is a one-way operation per realm, so this test lives

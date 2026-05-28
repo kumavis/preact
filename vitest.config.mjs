@@ -54,6 +54,10 @@ const alias = {
 	'^preact/secure$': path.join(
 		root,
 		MINIFY ? 'secure/dist/secure.mjs' : 'secure/src/index.js'
+	),
+	'^preact/compartment$': path.join(
+		root,
+		MINIFY ? 'compartment/dist/compartment.mjs' : 'compartment/src/index.js'
 	)
 };
 
@@ -124,6 +128,12 @@ const rollupAlias = [
 		replacement: MINIFY
 			? path.join(root, 'secure/dist/secure.mjs')
 			: path.join(root, 'secure/src/index.js')
+	},
+	{
+		find: /^preact\/compartment$/,
+		replacement: MINIFY
+			? path.join(root, 'compartment/dist/compartment.mjs')
+			: path.join(root, 'compartment/src/index.js')
 	}
 ];
 
@@ -244,7 +254,7 @@ export default defineConfig({
 				extends: true,
 				test: {
 					include: [
-						'{debug,devtools,hooks,compat,test-utils,jsx-runtime,secure}/test/{browser,shared}/**/*.test.js?(x)',
+						'{debug,devtools,hooks,compat,test-utils,jsx-runtime,secure,compartment}/test/{browser,shared}/**/*.test.js?(x)',
 						'./test/{browser,shared}/**/*.test.js?(x)'
 					],
 					setupFiles: ['./vitest.setup.js'],

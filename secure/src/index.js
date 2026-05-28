@@ -258,11 +258,27 @@ function SecureBoundary(props) {
 }
 SecureBoundary._isSecureBoundary = true;
 
+/**
+ * Inverse of `SecureBoundary`: anything rendered below this component is
+ * treated as host-trusted and is NOT sanitized. Used by add-on layers
+ * (e.g. `preact/compartment`) to splice host-controlled vnodes back into
+ * an otherwise-confined tree.
+ */
+export function SecureExit(props) {
+	return props.children;
+}
+SecureExit._isSecureExit = true;
+
 let installed = false;
 
 // How deep we are inside a SecureBoundary's render call(s). When > 0,
 // every newly created vnode is sanitized.
 let secureRenderDepth = 0;
+
+// How deep we are inside a SecureExit's render call(s). When > 0, the
+// sanitizer no-ops and `_secureCtx` does not propagate, so descendants
+// render as ordinary host content.
+let trustedExitDepth = 0;
 
 function install() {
 	if (installed) return;
@@ -280,10 +296,12 @@ function install() {
 		//    `_secureCtx` flag survived the renderComponent clone)
 		//  - this vnode's `_parent` already carries the secure marker
 		//    (for vnodes coerced during diffChildren)
+		// Skipped entirely if we are inside a SecureExit island.
 		if (
-			secureRenderDepth > 0 ||
-			vnode._secureCtx === true ||
-			(vnode._parent && vnode._parent._secureCtx === true)
+			trustedExitDepth === 0 &&
+			(secureRenderDepth > 0 ||
+				vnode._secureCtx === true ||
+				(vnode._parent && vnode._parent._secureCtx === true))
 		) {
 			vnode._secureCtx = true;
 			sanitizeVNode(vnode);
@@ -292,11 +310,17 @@ function install() {
 	};
 
 	options._render = vnode => {
-		if (
-			vnode._secureCtx === true ||
-			(vnode.type && vnode.type._isSecureBoundary === true) ||
-			(vnode._parent && vnode._parent._secureCtx === true) ||
-			secureRenderDepth > 0
+		// SecureExit boundary: enter a trusted island, suppress secure
+		// bookkeeping for the subtree.
+		if (vnode.type && vnode.type._isSecureExit === true) {
+			vnode._trustedExitBracketed = true;
+			trustedExitDepth++;
+		} else if (
+			trustedExitDepth === 0 &&
+			(vnode._secureCtx === true ||
+				(vnode.type && vnode.type._isSecureBoundary === true) ||
+				(vnode._parent && vnode._parent._secureCtx === true) ||
+				secureRenderDepth > 0)
 		) {
 			vnode._secureCtx = true;
 			vnode._secureBracketed = true;
@@ -309,6 +333,10 @@ function install() {
 		if (vnode._secureBracketed) {
 			vnode._secureBracketed = false;
 			secureRenderDepth--;
+		}
+		if (vnode._trustedExitBracketed) {
+			vnode._trustedExitBracketed = false;
+			trustedExitDepth--;
 		}
 		if (previousDiffed) previousDiffed(vnode);
 	};
@@ -393,6 +421,12 @@ function walkSanitize(node) {
 		return;
 	}
 	sanitizeVNode(node);
+	// Stop descending if the type advertises that it manages its own
+	// children's sanitization (e.g. `confineComponent`, which routes
+	// children through opaque sentinels). Without this halt, host
+	// children destined for opaque slots would be stripped of refs etc.
+	// before they ever reach the SecureExit island.
+	if (node.type && node.type._haltSanitizeChildren === true) return;
 	const children = node.props && node.props.children;
 	if (children != null) walkSanitize(children);
 }

@@ -89,3 +89,14 @@ export function secureRender(
 ): void;
 
 export function unmount(parentDom: ContainerNode): void;
+
+/**
+ * Boundary that disables sanitization for everything rendered inside it.
+ * Used by add-on layers (e.g. `preact/compartment`) to splice
+ * host-trusted vnodes back into an otherwise-confined tree. Components
+ * rendered below a `SecureExit` see real DOM events, real refs work,
+ * etc. Use only with vnodes the host fully controls.
+ */
+export const SecureExit: import('preact').FunctionComponent<{
+	children?: ComponentChild;
+}>;

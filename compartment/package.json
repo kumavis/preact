@@ -1,0 +1,15 @@
+{
+	"name": "preact-compartment",
+	"amdName": "preactCompartment",
+	"private": true,
+	"description": "Mount untrusted component code (e.g. from a SES Compartment) inside a Preact tree with no DOM access.",
+	"main": "dist/compartment.js",
+	"module": "dist/compartment.mjs",
+	"umd:main": "dist/compartment.umd.js",
+	"source": "src/index.js",
+	"types": "src/index.d.ts",
+	"license": "MIT",
+	"peerDependencies": {
+		"preact": "^11.0.0 || ^10.0.0"
+	}
+}

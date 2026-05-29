@@ -1,4 +1,4 @@
-import { createElement, createRef } from 'preact';
+import { createElement, createRef, render } from 'preact';
 import { secureRender, unmount, SecureExit } from 'preact/secure';
 import {
 	confineComponent,
@@ -39,6 +39,38 @@ describe('preact/compartment', () => {
 		secureRender(<Confined who="world" />, scratch);
 		expect(scratch.firstChild.className).to.equal('k');
 		expect(scratch.firstChild.textContent).to.equal('hi world');
+	});
+
+	it('the endowments bundle is frozen', () => {
+		let seenEndowments;
+		const Confined = confineComponent(endowments => {
+			seenEndowments = endowments;
+			return endowments.h('span', null, 'x');
+		});
+		secureRender(<Confined />, scratch);
+		expect(Object.isFrozen(seenEndowments)).to.equal(true);
+		// Reassignment of a known field throws in strict mode (the
+		// module is ESM, so the function body runs strict).
+		expect(() => {
+			seenEndowments.h = () => null;
+		}).to.throw();
+		// Adding a new field also fails on a frozen object.
+		expect(() => {
+			seenEndowments.evil = 'leak';
+		}).to.throw();
+	});
+
+	it('attacker function is called with this === undefined', () => {
+		let seenThis = 'untouched';
+		const Confined = confineComponent(function (endowments, props) {
+			// not an arrow — the function captures its own `this`.
+			seenThis = this;
+			return endowments.h('span', null, 'x');
+		});
+		secureRender(<Confined />, scratch);
+		// `Reflect.apply(fn, undefined, …)` plus strict-mode source
+		// means `this` is genuinely undefined, not the global object.
+		expect(seenThis).to.equal(undefined);
 	});
 
 	it('attacker can use hooks from endowments for local state', () => {
@@ -101,6 +133,68 @@ describe('preact/compartment', () => {
 		secureRender(<Confined />, scratch);
 		// Proxies have a real Object constructor so the coercer rejects them.
 		expect(scratch.innerHTML).to.equal('');
+	});
+
+	it('a throwing getter on value.type aborts the value, not the host render', () => {
+		const Confined = confineComponent(() => ({
+			constructor: undefined,
+			get type() {
+				throw new Error('hostile type getter');
+			},
+			props: { children: 'x' }
+		}));
+		expect(() =>
+			secureRender(
+				<div class="host">
+					<Confined />
+					<span class="next">still here</span>
+				</div>,
+				scratch
+			)
+		).to.not.throw();
+		// the host's sibling rendered normally
+		expect(scratch.querySelector('.next').textContent).to.equal('still here');
+	});
+
+	it('a throwing getter on value.props aborts the value, not the host render', () => {
+		const Confined = confineComponent(() => ({
+			constructor: undefined,
+			type: 'div',
+			get props() {
+				throw new Error('hostile props getter');
+			}
+		}));
+		expect(() =>
+			secureRender(
+				<div class="host">
+					<Confined />
+					<span class="next">still here</span>
+				</div>,
+				scratch
+			)
+		).to.not.throw();
+		expect(scratch.querySelector('.next').textContent).to.equal('still here');
+	});
+
+	it('a throwing getter on value.key aborts the value, not the host render', () => {
+		const Confined = confineComponent(() => ({
+			constructor: undefined,
+			type: 'div',
+			props: { children: 'x' },
+			get key() {
+				throw new Error('hostile key getter');
+			}
+		}));
+		expect(() =>
+			secureRender(
+				<div class="host">
+					<Confined />
+					<span class="next">still here</span>
+				</div>,
+				scratch
+			)
+		).to.not.throw();
+		expect(scratch.querySelector('.next').textContent).to.equal('still here');
 	});
 
 	it('replaces a vnode with a class-instance .type with a Fragment', () => {
@@ -493,5 +587,34 @@ describe('preact/compartment', () => {
 		const lastEl = refHistory[refHistory.length - 1];
 		expect(firstEl).to.be.instanceof(Element);
 		expect(lastEl).to.equal(firstEl);
+	});
+
+	it('coercer alone (mounted via plain preact.render, no secureRender) still drops refs and freezes props', () => {
+		// Without secureRender, the URL-scheme / disallowed-tag / SafeEvent
+		// layer is off — but the compartment coercer still must:
+		//   - drop the attacker's ref so the DOM node never leaks
+		//   - freeze the props object the attacker sees
+		const seen = {};
+		const Confined = confineComponent(({ h }, props) => {
+			seen.frozen = Object.isFrozen(props);
+			seen.ref = props.ref;
+			// Attacker attempts to attach a ref to grab the DOM.
+			const stealRef = el => {
+				seen.stolen = el;
+			};
+			return h('div', { ref: stealRef, class: 'attacker' }, 'x');
+		});
+		// Plain `render`, not `secureRender`. The host has decided not to
+		// use the secure layer at all.
+		render(<Confined hi="there" />, scratch);
+		expect(seen.frozen).to.equal(true);
+		// The host's props sent through the wrapper do NOT include a ref
+		// even if the host hadn't passed one — the field is just absent.
+		expect(seen.ref).to.equal(undefined);
+		// The attacker's ref was dropped by the coercer (h() with the
+		// rebuilt props discards it because the coercer never read it).
+		expect(seen.stolen).to.equal(undefined);
+		// The element rendered as a side effect of normal preact render.
+		expect(scratch.querySelector('.attacker').textContent).to.equal('x');
 	});
 });

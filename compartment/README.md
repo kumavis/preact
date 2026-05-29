@@ -24,7 +24,15 @@ import { secureRender } from 'preact/secure';
 
 ```js
 import 'ses';
-lockdown();
+
+// IMPORTANT: pass `overrideTaming: 'severe'` so prototype properties
+// (notably `constructor`) stay overridable. Preact's vnode-clone
+// helper writes `constructor: undefined` as the vnode tag, and
+// without this option SES will throw when the helper tries to
+// overwrite the frozen `Object.prototype.constructor`. The lockdown
+// is still real — primordials are frozen, the compartment isolation
+// is in force.
+lockdown({ overrideTaming: 'severe' });
 
 // Host evaluates untrusted source in its own compartment.
 const compartment = new Compartment(/* host's chosen globals */);
@@ -115,6 +123,22 @@ When a sentinel mounts, it routes the original host vnode through a
 refs work, host event handlers fire with real DOM events, etc. The
 host trusts its own subtree.
 
+### Nesting and lifecycle
+
+- **Confined inside SecureExit re-engages sanitization.** A host can
+  render a host-trusted subtree (the `SecureExit` island) that itself
+  contains a confined component. The confined component restarts
+  sanitization for everything it returns, so an attacker buried
+  inside an island still cannot reach the DOM.
+- **Confined inside confined works.** A confined component's coercer
+  recognises other confined component types and renders them
+  normally. Each nested confined level applies its own coercer.
+- **Multi-mount cleanup.** Each render mints fresh opaque sentinels;
+  the WeakMap entries from a previous mount are not consulted on the
+  next. Mounting `Confined` with one set of children, unmounting,
+  and re-mounting with different children renders the new content,
+  not stale content.
+
 ## Callback props — security note
 
 If the host passes a function-typed prop (e.g. an `onSubmit` callback
@@ -160,6 +184,32 @@ value, it:
 
 Anything that survives is built into a fresh vnode via our own `h()`;
 the attacker's original object is discarded.
+
+## Using the coercer without `secureRender`
+
+A confined component mounted with plain `preact.render` (not
+`secureRender`) gets a meaningful subset of the protections:
+
+- the attacker function is still called via `Reflect.apply(fn,
+  undefined, [endowments, props])`, so `this === undefined`;
+- the endowments bundle and the props bag are still frozen;
+- the return value is still coerced — fake vnodes, Proxies, plain
+  objects, and Promises are dropped;
+- `key` is preserved; `ref` is silently dropped because the coercer
+  never reads it.
+
+But the surrounding `preact/secure` layer is off, so the following
+are NOT in force when the host skips `secureRender`:
+
+- URL-scheme checks (`javascript:` URLs reach the DOM).
+- The disallowed-tag allowlist (`<script>`, `<iframe>`, etc. render).
+- `dangerouslySetInnerHTML` is not stripped.
+- Event handlers receive raw DOM `Event` objects, not `SafeEvent`.
+
+The expected mounting pattern is `secureRender(h(Confined, …), root)`.
+The standalone coercer is a useful belt-and-braces — it's how the
+compartment layer defends if, for example, a future host code path
+ever stops going through `secureRender` for some subtree.
 
 ## What's NOT in this module
 

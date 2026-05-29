@@ -182,3 +182,42 @@ currently exposed — file an issue if you need it).
   (`vnode`, `_render`, `diffed`, `_catchError`) once. The hooks are
   no-ops outside a secure subtree, so importing this module does not
   affect the rest of the page's render pipeline.
+
+### How the input tree is sanitized
+
+A call to `secureRender(vnode, parentDom, opts?)` does three things in
+order:
+
+1. Resolves the per-tree allowlist (from `opts.allowedTags` or the
+   default ~80-tag list).
+2. Walks `vnode` once *eagerly* — `walkSanitize` — and strips refs,
+   blocks dangerous props, replaces disallowed tags with Fragments,
+   and scheme-checks URLs. This catches vnodes the host created before
+   the depth-based options hooks could see them.
+3. Wraps `vnode` in a `SecureBoundary` and hands it to Preact's
+   `render`. From then on the option hooks (`vnode`, `_render`,
+   `diffed`, `_catchError`) sanitize state-driven re-renders and
+   propagate the per-tree allowlist down via a `_secureAllowedTags`
+   field on each vnode.
+
+The entry-time walk stops descending at two markers:
+
+- A vnode whose type is `SecureExit` — its children are an explicitly
+  trusted island and must keep their refs.
+- A vnode whose type has `type._haltSanitizeChildren === true` — used
+  by `preact/compartment` so host children destined for opaque slots
+  reach the slot un-stripped. Other addons can opt into the same
+  contract by setting the flag on their wrapper functions.
+
+### Defense-in-depth notes
+
+- `options._render` deliberately does NOT trust `vnode._secureCtx` set
+  on the child vnode alone. The bracket is entered only when a parent
+  or the boundary type marker is present. Today every flagged vnode
+  comes from our own hooks, so this is conservative; the gate would
+  still hold if a future code path ever mounted a vnode without going
+  through the input-tree walk first.
+- The `trustedExitDepth` and `secureRenderDepth` counters are cleaned
+  up in `options._catchError`, so an unhandled render exception does
+  not leave the renderer in a half-bracketed state and subsequent
+  host renders are handled correctly.

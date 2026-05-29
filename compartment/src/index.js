@@ -164,19 +164,24 @@ function coerceProps(props) {
 	if (props == null || typeof props !== 'object') {
 		return { rest, children };
 	}
+	// Use Reflect.ownKeys so a Proxy that throws on Object.keys can still
+	// be handled (we wrap each read in try/catch below). Symbols are
+	// skipped because every meaningful Preact prop is string-keyed and
+	// a symbol-keyed getter could fire as a side effect during diff.
 	let keys;
 	try {
 		keys = Object.keys(props);
 	} catch (_) {
-		return { rest, children };
+		try {
+			keys = Reflect.ownKeys(props).filter(k => typeof k === 'string');
+		} catch (__) {
+			return { rest, children };
+		}
 	}
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
 		// `children` is special: split out so we can recursively coerce
-		// and forward as positional `h()` arguments. Anything else is
-		// shallowly copied — the secure renderer is the layer that
-		// strips refs, URL schemes, etc. Deep structural sanitization of
-		// non-children prop values is intentionally out of scope here.
+		// and forward as positional `h()` arguments.
 		let value;
 		try {
 			value = props[key];
@@ -192,9 +197,60 @@ function coerceProps(props) {
 			}
 			continue;
 		}
+		// `style` is read by Preact's commit phase via `for (name in value)`
+		// and `value[name]` — if the attacker installs a getter that has
+		// side effects, those getters fire while we're applying the DOM.
+		// Defensive shallow copy reads each own data property once via a
+		// descriptor and drops accessors, neutering the getter trick.
+		if (key === 'style' && value !== null && typeof value === 'object') {
+			rest[key] = shallowDataCopy(value);
+			continue;
+		}
 		rest[key] = value;
 	}
 	return { rest, children };
+}
+
+/**
+ * Shallow copy that reads own data properties only — accessors are
+ * dropped, so getters never fire during the secure renderer's commit
+ * phase. Used for prop values like `style` that Preact iterates and
+ * reads in-place when applying to the DOM.
+ */
+function shallowDataCopy(obj) {
+	const out = {};
+	let keys;
+	try {
+		keys = Object.keys(obj);
+	} catch (_) {
+		return out;
+	}
+	for (let i = 0; i < keys.length; i++) {
+		const k = keys[i];
+		let desc;
+		try {
+			desc = Object.getOwnPropertyDescriptor(obj, k);
+		} catch (_) {
+			continue;
+		}
+		if (desc && 'value' in desc) {
+			const v = desc.value;
+			// Only carry primitives — nested objects could themselves hide
+			// accessors. Functions are kept (some style libraries embed
+			// units as templates, but for `style` we want strings/numbers).
+			const t = typeof v;
+			if (
+				v === null ||
+				t === 'string' ||
+				t === 'number' ||
+				t === 'boolean' ||
+				t === 'bigint'
+			) {
+				out[k] = v;
+			}
+		}
+	}
+	return out;
 }
 
 /**

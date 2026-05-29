@@ -1,5 +1,5 @@
 import { createElement, createRef } from 'preact';
-import { secureRender, unmount } from 'preact/secure';
+import { secureRender, unmount, SecureExit } from 'preact/secure';
 import {
 	confineComponent,
 	isConfinedComponent
@@ -344,6 +344,125 @@ describe('preact/compartment', () => {
 		expect(after[0]).to.equal(byKey.get('c'));
 		expect(after[1]).to.equal(byKey.get('a'));
 		expect(after[2]).to.equal(byKey.get('b'));
+	});
+
+	it('Proxy props that throws on Object.keys is handled, not propagated', () => {
+		const Confined = confineComponent(({ h }) => {
+			const proxiedProps = new Proxy(
+				{ label: 'visible' },
+				{
+					ownKeys() {
+						throw new Error('no listing');
+					}
+				}
+			);
+			// Attacker returns a vnode whose props is a hostile proxy. The
+			// coercer must walk it defensively and not propagate the throw.
+			return { type: 'div', props: proxiedProps, constructor: undefined };
+		});
+		expect(() => secureRender(<Confined />, scratch)).to.not.throw();
+		// Coercer dropped all props; the div is empty.
+		expect(scratch.querySelector('div')).to.exist;
+	});
+
+	it('style getters do not fire during commit', () => {
+		let getterCalls = 0;
+		const Confined = confineComponent(({ h }) => {
+			const style = {};
+			Object.defineProperty(style, 'color', {
+				get() {
+					getterCalls++;
+					return 'red';
+				},
+				enumerable: true
+			});
+			Object.defineProperty(style, 'backgroundColor', {
+				value: 'blue',
+				enumerable: true
+			});
+			return h('div', { style }, 'x');
+		});
+		secureRender(<Confined />, scratch);
+		// The accessor `color` is dropped by `shallowDataCopy`; only the
+		// data property `backgroundColor` survives.
+		expect(getterCalls).to.equal(0);
+		const div = scratch.querySelector('div');
+		expect(div.style.color).to.equal('');
+		expect(div.style.backgroundColor).to.equal('blue');
+	});
+
+	it('Symbol-keyed prop getters do not fire', () => {
+		let getterCalls = 0;
+		const evilKey = Symbol('evil');
+		const Confined = confineComponent(({ h }) => {
+			const props = {};
+			Object.defineProperty(props, evilKey, {
+				get() {
+					getterCalls++;
+					return 'leak';
+				},
+				enumerable: true
+			});
+			Object.defineProperty(props, 'children', {
+				value: h('span', null, 'ok'),
+				enumerable: true
+			});
+			return { type: 'div', props, constructor: undefined };
+		});
+		secureRender(<Confined />, scratch);
+		expect(getterCalls).to.equal(0);
+		expect(scratch.querySelector('span').textContent).to.equal('ok');
+	});
+
+	it('confined component nested inside a SecureExit re-engages sanitization', () => {
+		const hostRefInExit = createRef();
+		const refInsideConfined = createRef();
+		const Confined = confineComponent(({ h }) =>
+			// Attacker inside the confined component tries to attach a ref.
+			h('div', { ref: refInsideConfined }, 'attacker')
+		);
+		// Tree: secureRender root -> div -> SecureExit -> Confined.
+		// The SecureExit creates a trusted island where host refs work,
+		// but a `Confined` inside it must STILL strip attacker refs.
+		secureRender(
+			<div>
+				<SecureExit>
+					<div ref={hostRefInExit}>host inside exit</div>
+					<Confined />
+				</SecureExit>
+			</div>,
+			scratch
+		);
+		expect(hostRefInExit.current).to.be.instanceof(Element);
+		// Attacker ref must still be null — Confined re-enters secure context.
+		expect(refInsideConfined.current).to.equal(null);
+	});
+
+	it('multi-mount with different children does not leak old slots', () => {
+		// Mount, unmount, re-mount the same confined component with a
+		// different host child. Ensure the new mount renders the new
+		// host child (not the old one) — would fail if the WeakMap
+		// lookup picked up a stale slot.
+		const Confined = confineComponent(({ h }, props) =>
+			h('section', null, props.children)
+		);
+		secureRender(
+			<Confined>
+				<span class="first">FIRST</span>
+			</Confined>,
+			scratch
+		);
+		expect(scratch.querySelector('.first')).to.exist;
+		unmount(scratch);
+		scratch = setupScratch();
+		secureRender(
+			<Confined>
+				<span class="second">SECOND</span>
+			</Confined>,
+			scratch
+		);
+		expect(scratch.querySelector('.first')).to.equal(null);
+		expect(scratch.querySelector('.second').textContent).to.equal('SECOND');
 	});
 
 	it('host children keep stable identity across re-renders (host refs persist)', () => {

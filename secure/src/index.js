@@ -280,6 +280,24 @@ let secureRenderDepth = 0;
 // render as ordinary host content.
 let trustedExitDepth = 0;
 
+// Allowlist of the secure tree currently being rendered. Multiple
+// secure trees can coexist with different allowlists; we keep the
+// previous values on a stack and pop on diffed.
+let currentAllowedTags = DEFAULT_ALLOWED_TAGS;
+const allowedTagsStack = [];
+
+function pushAllowedTags(next) {
+	allowedTagsStack.push(currentAllowedTags);
+	currentAllowedTags = next;
+}
+
+function popAllowedTags() {
+	currentAllowedTags =
+		allowedTagsStack.length > 0
+			? allowedTagsStack.pop()
+			: DEFAULT_ALLOWED_TAGS;
+}
+
 function install() {
 	if (installed) return;
 	installed = true;
@@ -305,7 +323,17 @@ function install() {
 				(vnode._parent && vnode._parent._secureCtx === true))
 		) {
 			vnode._secureCtx = true;
-			sanitizeVNode(vnode);
+			// Resolve allowlist: prefer the one cached on the vnode (clone
+			// from a re-render), then the parent's, then the active stack
+			// top. This keeps multiple secure trees with different
+			// allowlists from stepping on each other when their renders
+			// interleave via setState.
+			const tags =
+				vnode._secureAllowedTags ||
+				(vnode._parent && vnode._parent._secureAllowedTags) ||
+				currentAllowedTags;
+			vnode._secureAllowedTags = tags;
+			sanitizeVNode(vnode, tags);
 		}
 		if (previousVnode) previousVnode(vnode);
 	};
@@ -331,6 +359,23 @@ function install() {
 		) {
 			vnode._secureCtx = true;
 			vnode._secureBracketed = true;
+			// Resolve and push the allowlist for the duration of this
+			// component's render. The boundary props carry the per-tree
+			// allowlist; descendants inherit via their parent's cached
+			// `_secureAllowedTags`, surviving renderComponent clones.
+			let tags;
+			if (vnode.type && vnode.type._isSecureBoundary === true) {
+				tags =
+					(vnode.props && vnode.props._allowedTags) ||
+					DEFAULT_ALLOWED_TAGS;
+			} else {
+				tags =
+					vnode._secureAllowedTags ||
+					(vnode._parent && vnode._parent._secureAllowedTags) ||
+					currentAllowedTags;
+			}
+			vnode._secureAllowedTags = tags;
+			pushAllowedTags(tags);
 			secureRenderDepth++;
 		}
 		if (previousRender) previousRender(vnode);
@@ -340,6 +385,7 @@ function install() {
 		if (vnode._secureBracketed) {
 			vnode._secureBracketed = false;
 			secureRenderDepth--;
+			popAllowedTags();
 		}
 		if (vnode._trustedExitBracketed) {
 			vnode._trustedExitBracketed = false;
@@ -358,6 +404,7 @@ function install() {
 			if (vnode._secureBracketed) {
 				vnode._secureBracketed = false;
 				secureRenderDepth--;
+				popAllowedTags();
 			}
 			if (vnode._trustedExitBracketed) {
 				vnode._trustedExitBracketed = false;
@@ -368,7 +415,7 @@ function install() {
 	};
 }
 
-function sanitizeVNode(vnode) {
+function sanitizeVNode(vnode, allowedTags) {
 	if (vnode.ref) vnode.ref = null;
 
 	const props = vnode.props;
@@ -382,7 +429,7 @@ function sanitizeVNode(vnode) {
 
 	if (typeof vnode.type === 'string') {
 		const tag = vnode.type.toLowerCase();
-		if (!activeAllowedTags.has(tag)) {
+		if (!allowedTags.has(tag)) {
 			vnode.type = Fragment;
 			vnode.props = { children: props.children };
 			return;
@@ -430,31 +477,38 @@ function wrapListener(userFn) {
 	return w;
 }
 
-let activeAllowedTags = DEFAULT_ALLOWED_TAGS;
-
 /**
  * Recursively sanitize a vnode tree. Used for the input tree handed to
  * `secureRender` (those vnodes were already created before the depth-
  * based hook could see them). State-driven re-renders inside the secure
  * tree are covered by the options.vnode hook.
  */
-function walkSanitize(node) {
+function walkSanitize(node, allowedTags) {
 	if (Array.isArray(node)) {
-		for (let i = 0; i < node.length; i++) walkSanitize(node[i]);
+		for (let i = 0; i < node.length; i++) walkSanitize(node[i], allowedTags);
 		return;
 	}
 	if (!node || typeof node !== 'object' || node.constructor !== undefined) {
 		return;
 	}
-	sanitizeVNode(node);
-	// Stop descending if the type advertises that it manages its own
-	// children's sanitization (e.g. `confineComponent`, which routes
-	// children through opaque sentinels). Without this halt, host
-	// children destined for opaque slots would be stripped of refs etc.
-	// before they ever reach the SecureExit island.
-	if (node.type && node.type._haltSanitizeChildren === true) return;
+	sanitizeVNode(node, allowedTags);
+	node._secureAllowedTags = allowedTags;
+	// Stop descending if:
+	//  - the type is a `SecureExit` (its subtree is explicitly trusted)
+	//  - the type advertises that it manages its own children's
+	//    sanitization (e.g. `confineComponent`, which routes children
+	//    through opaque sentinels)
+	// Without these halts, host content destined for trusted islands
+	// would be stripped of refs etc. before it ever reaches the island.
+	const type = node.type;
+	if (
+		type &&
+		(type._isSecureExit === true || type._haltSanitizeChildren === true)
+	) {
+		return;
+	}
 	const children = node.props && node.props.children;
-	if (children != null) walkSanitize(children);
+	if (children != null) walkSanitize(children, allowedTags);
 }
 
 /**
@@ -466,16 +520,21 @@ function walkSanitize(node) {
  * @param {{ allowedTags?: Iterable<string> }} [opts]
  */
 export function secureRender(vnode, parentDom, opts) {
-	if (opts && opts.allowedTags) {
-		activeAllowedTags = new Set(
-			Array.from(opts.allowedTags, tag => String(tag).toLowerCase())
-		);
-	} else {
-		activeAllowedTags = DEFAULT_ALLOWED_TAGS;
-	}
+	const allowedTags =
+		opts && opts.allowedTags
+			? new Set(
+					Array.from(opts.allowedTags, tag => String(tag).toLowerCase())
+				)
+			: DEFAULT_ALLOWED_TAGS;
 	install();
-	walkSanitize(vnode);
-	preactRender(h(SecureBoundary, null, vnode), parentDom);
+	walkSanitize(vnode, allowedTags);
+	// Stash the per-tree allowlist on the boundary so concurrent secure
+	// trees with different allowlists can coexist. The `_allowedTags`
+	// prop is picked up by `options._render` when the boundary mounts.
+	preactRender(
+		h(SecureBoundary, { _allowedTags: allowedTags }, vnode),
+		parentDom
+	);
 }
 
 /** Tear down a secure tree. */

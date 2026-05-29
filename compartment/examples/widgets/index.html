@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>preact/compartment — confined widgets demo</title>
+		<style>
+			body {
+				font: 14px/1.4 system-ui, sans-serif;
+				margin: 0;
+				background: #fafafa;
+				color: #222;
+			}
+			header {
+				background: #1d3557;
+				color: #fff;
+				padding: 12px 20px;
+			}
+			header h1 {
+				margin: 0;
+				font-size: 18px;
+			}
+			header small {
+				opacity: 0.7;
+			}
+			main {
+				display: grid;
+				grid-template-columns: repeat(3, 1fr);
+				gap: 20px;
+				padding: 20px;
+			}
+			section.widget {
+				background: #fff;
+				border: 1px solid #ddd;
+				border-radius: 4px;
+				padding: 16px;
+			}
+			section.widget > h2 {
+				margin-top: 0;
+				font-size: 14px;
+				color: #1d3557;
+				border-bottom: 1px solid #eee;
+				padding-bottom: 6px;
+			}
+			.widget .body {
+				margin: 12px 0;
+			}
+			.host-slot {
+				display: block;
+				margin-top: 8px;
+				padding: 6px 10px;
+				background: #f1faee;
+				border: 1px dashed #a8dadc;
+				border-radius: 3px;
+				font-size: 12px;
+			}
+			.event-log {
+				margin: 20px;
+				padding: 10px;
+				background: #1d3557;
+				color: #a8dadc;
+				font-family: ui-monospace, monospace;
+				font-size: 12px;
+				max-height: 200px;
+				overflow: auto;
+				white-space: pre-wrap;
+			}
+		</style>
+	</head>
+	<body>
+		<header>
+			<h1>preact/compartment demo</h1>
+			<small
+				>Three confined widgets, each evaluated in its own SES Compartment</small
+			>
+		</header>
+		<main id="root"></main>
+		<pre class="event-log" id="log"></pre>
+
+		<script type="module" src="./main.js"></script>
+	</body>
+</html>

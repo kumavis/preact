@@ -287,6 +287,7 @@ function install() {
 	const previousVnode = options.vnode;
 	const previousRender = options._render;
 	const previousDiffed = options.diffed;
+	const previousCatchError = options._catchError;
 
 	options.vnode = vnode => {
 		// Sanitize when:
@@ -311,14 +312,20 @@ function install() {
 
 	options._render = vnode => {
 		// SecureExit boundary: enter a trusted island, suppress secure
-		// bookkeeping for the subtree.
+		// bookkeeping for the subtree. This branch wins even when nested
+		// inside a secure tree — the whole point is to opt out.
 		if (vnode.type && vnode.type._isSecureExit === true) {
 			vnode._trustedExitBracketed = true;
 			trustedExitDepth++;
 		} else if (
 			trustedExitDepth === 0 &&
-			(vnode._secureCtx === true ||
-				(vnode.type && vnode.type._isSecureBoundary === true) ||
+			// We deliberately do NOT trust `vnode._secureCtx` on its own here.
+			// That flag is set by our own hooks on real renders, so it's
+			// safe today, but relying on the *parent* / boundary type alone
+			// keeps the gate from getting opened by a pre-flagged vnode if
+			// some future code path mounts a vnode without going through
+			// the coercer.
+			((vnode.type && vnode.type._isSecureBoundary === true) ||
 				(vnode._parent && vnode._parent._secureCtx === true) ||
 				secureRenderDepth > 0)
 		) {
@@ -339,6 +346,25 @@ function install() {
 			trustedExitDepth--;
 		}
 		if (previousDiffed) previousDiffed(vnode);
+	};
+
+	// If a render throws and no error boundary catches it, `options.diffed`
+	// never fires for the throwing vnode and our depth counter would
+	// stay elevated — the next host render would then incorrectly be
+	// treated as secure. Hook `options._catchError` to clean up the
+	// brackets we stamped in `options._render` on the affected vnode.
+	options._catchError = (error, vnode, oldVNode, errorInfo) => {
+		if (vnode) {
+			if (vnode._secureBracketed) {
+				vnode._secureBracketed = false;
+				secureRenderDepth--;
+			}
+			if (vnode._trustedExitBracketed) {
+				vnode._trustedExitBracketed = false;
+				trustedExitDepth--;
+			}
+		}
+		return previousCatchError(error, vnode, oldVNode, errorInfo);
 	};
 }
 

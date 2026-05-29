@@ -272,4 +272,107 @@ describe('preact/compartment', () => {
 		);
 		expect(scratch.querySelector('.slot').children.length).to.equal(0);
 	});
+
+	it('onError option fires with the thrown value', () => {
+		const captured = [];
+		const Confined = confineComponent(
+			() => {
+				throw new Error('boom');
+			},
+			{
+				onError: err => {
+					captured.push(err);
+				}
+			}
+		);
+		secureRender(<Confined />, scratch);
+		expect(captured).to.have.lengthOf(1);
+		expect(captured[0].message).to.equal('boom');
+	});
+
+	it('an onError that itself throws does not break the host render', () => {
+		const Confined = confineComponent(
+			() => {
+				throw new Error('boom');
+			},
+			{
+				onError: () => {
+					throw new Error('telemetry exploded');
+				}
+			}
+		);
+		expect(() => {
+			secureRender(
+				<div class="host">
+					<Confined />
+					<span class="next">still here</span>
+				</div>,
+				scratch
+			);
+		}).to.not.throw();
+		expect(scratch.querySelector('.next').textContent).to.equal('still here');
+	});
+
+	it('preserves attacker keys across re-render: keyed list reorder reuses DOM nodes', () => {
+		// Each <li> we render carries a known DOM node we can identify
+		// by data-attribute. After a reorder, those same physical nodes
+		// should appear in the new positions if keys reconciled.
+		let setOrder;
+		function Host() {
+			const order = ['a', 'b', 'c'];
+			// We expose setOrder by closing over it from a host hook.
+			// Simpler: render twice with different orders.
+			return null;
+		}
+		const Confined = confineComponent(({ h }, props) =>
+			h(
+				'ul',
+				null,
+				...props.items.map(k =>
+					h('li', { key: k, 'data-k': k }, String(k))
+				)
+			)
+		);
+		secureRender(<Confined items={['a', 'b', 'c']} />, scratch);
+		const before = Array.from(scratch.querySelectorAll('li'));
+		const byKey = new Map(before.map(li => [li.getAttribute('data-k'), li]));
+
+		secureRender(<Confined items={['c', 'a', 'b']} />, scratch);
+		const after = Array.from(scratch.querySelectorAll('li'));
+
+		// Same DOM nodes, just rearranged — proves keys round-tripped.
+		expect(after[0]).to.equal(byKey.get('c'));
+		expect(after[1]).to.equal(byKey.get('a'));
+		expect(after[2]).to.equal(byKey.get('b'));
+	});
+
+	it('host children keep stable identity across re-renders (host refs persist)', () => {
+		// If the opaque-slot wrapping lost keys, the host's <div> would be
+		// torn down + remounted on each render, and the host's ref would
+		// receive `null` then a new element.
+		const refHistory = [];
+		const hostRef = el => {
+			refHistory.push(el);
+		};
+		const Confined = confineComponent(({ h }, props) =>
+			h('section', null, props.children)
+		);
+		secureRender(
+			<Confined key="x">
+				<div ref={hostRef}>persistent</div>
+			</Confined>,
+			scratch
+		);
+		const firstEl = refHistory[refHistory.length - 1];
+		// re-render with the same children
+		secureRender(
+			<Confined key="x">
+				<div ref={hostRef}>persistent</div>
+			</Confined>,
+			scratch
+		);
+		const lastEl = refHistory[refHistory.length - 1];
+		expect(firstEl).to.be.instanceof(Element);
+		expect(lastEl).to.equal(firstEl);
+	});
 });

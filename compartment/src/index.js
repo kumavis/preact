@@ -98,6 +98,7 @@ function coerceToSafeVNode(value) {
 	// getters that throw or that return varying values per read.
 	let type;
 	let props;
+	let key;
 	try {
 		type = value.type;
 	} catch (_) {
@@ -108,9 +109,25 @@ function coerceToSafeVNode(value) {
 	} catch (_) {
 		return null;
 	}
+	try {
+		// `key` lives on the vnode itself, not in `props`. Preserve it so
+		// the attacker's keyed lists reconcile correctly (and so host
+		// children we re-wrap with `key: i` keep stable identity across
+		// re-renders even when the attacker reorders them).
+		key = value.key;
+	} catch (_) {
+		key = undefined;
+	}
+	// `ref` is intentionally NOT read. Even though the secure renderer
+	// strips refs in its sanitize pass, the coercer drops them here too
+	// so behavior is correct if the compartment is ever mounted without
+	// `secureRender` on top (e.g. a unit test).
 
 	const safeType = coerceType(type);
 	const { children, rest } = coerceProps(props);
+	// Surface the key via props so `h()` picks it up — `h` extracts `key`
+	// from props before forwarding to `createVNode`.
+	if (key != null) rest.key = key;
 	return h(safeType, rest, ...children);
 }
 
@@ -207,8 +224,12 @@ function wrapOpaqueChildren(children) {
  * @param {(endowments: object, props: object) => unknown} fn
  *   The untrusted function. Must accept `(endowments, props)`. May
  *   return any value; the wrapper coerces it.
- * @param {{ name?: string }} [opts]
- *   Optional metadata. `name` shows up in devtools.
+ * @param {{ name?: string, onError?: (err: unknown) => void }} [opts]
+ *   `name` is a display name for devtools. `onError`, if provided, is
+ *   called whenever the attacker function throws — useful for
+ *   telemetry. It is invoked with the thrown value; any exception it
+ *   throws is swallowed so a misbehaving telemetry hook cannot itself
+ *   crash the host render.
  * @returns {import('preact').FunctionComponent}
  */
 export function confineComponent(fn, opts) {
@@ -217,6 +238,7 @@ export function confineComponent(fn, opts) {
 	}
 	const displayName =
 		(opts && typeof opts.name === 'string' && opts.name) || 'Confined';
+	const onError = opts && typeof opts.onError === 'function' ? opts.onError : null;
 
 	function Confined(rawProps) {
 		// Split host children off and replace with opaque sentinels.
@@ -230,7 +252,14 @@ export function confineComponent(fn, opts) {
 		let result;
 		try {
 			result = Reflect.apply(fn, undefined, [endowments, sanitizedProps]);
-		} catch (_) {
+		} catch (err) {
+			if (onError) {
+				try {
+					onError(err);
+				} catch (_) {
+					// telemetry hook must not break the host render
+				}
+			}
 			return null;
 		}
 		return coerceToSafeVNode(result);

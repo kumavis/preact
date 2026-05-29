@@ -17,21 +17,29 @@ export interface CompartmentEndowments {
 }
 
 /**
- * Shape of the props the attacker sees. The host's `children` is
- * replaced with an array of opaque sentinel vnodes the attacker can
- * position but not inspect.
+ * Shape of the props the attacker sees. The host's `children`, if any,
+ * is replaced with an array of opaque sentinel vnodes the attacker can
+ * position but not inspect. When the host renders the component with no
+ * children, `children` is `undefined`.
  *
  * SECURITY: any function-typed prop the host passes through (e.g. an
  * `onSubmit` callback) is callable by the attacker with arbitrary
  * arguments. Host code MUST treat those arguments as untrusted JSON.
  */
 export type ConfinedProps<P extends object = {}> = Readonly<P> & {
-	readonly children?: readonly unknown[];
+	readonly children?: readonly unknown[] | undefined;
 };
 
 export interface ConfineOptions {
 	/** Display name used by devtools. Default: `"Confined"`. */
 	name?: string;
+	/**
+	 * Called when the attacker function throws during render. The
+	 * confined component renders nothing on that pass; the host render
+	 * is not disrupted. Useful for telemetry. Exceptions from
+	 * `onError` itself are swallowed.
+	 */
+	onError?: (error: unknown) => void;
 }
 
 /**

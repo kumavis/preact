@@ -126,6 +126,8 @@
     "build:test-utils": "microbundle build --raw --no-generateTypes -f cjs,esm,umd --cwd test-utils",
     "build:compat": "microbundle build --raw --no-generateTypes -f cjs,esm,umd --cwd compat --globals 'preact/hooks=preactHooks'",
     "build:jsx": "microbundle build --raw --no-generateTypes -f cjs,esm,umd --cwd jsx-runtime",
+    "build:secure": "microbundle build --raw --no-generateTypes -f cjs,esm,umd --cwd secure",
+    "build:compartment": "microbundle build --raw --no-generateTypes -f cjs,esm,umd --cwd compartment --globals 'preact/hooks=preactHooks,preact/secure=preactSecure'",
     "postbuild": "node ./config/compat-entries.js",
     "dev": "microbundle watch --raw --no-generateTypes --format cjs",
     "dev:hooks": "microbundle watch --raw --no-generateTypes --format cjs --cwd hooks",

@@ -133,12 +133,28 @@ const URL_ATTRS = new Set([
 // Props that must never reach Preact's prop-application path on a DOM
 // element. Beyond the obvious HTML-injection vectors
 // (`dangerouslySetInnerHTML`, `srcdoc`) and the custom-element registration
-// vector (`is`), this set also covers the DOM-property writeables
-// (`innerHTML`, `outerHTML`, `textContent`, `innerText`, `nodeValue`) that
-// Preact's `setProperty` (`src/diff/props.js`) assigns via the `name in
-// dom` setter path — without this entry, an attacker can return
-// `h('div', { innerHTML: '<img onerror=…>' })` and trigger script
-// execution.
+// vector (`is`), this set also covers:
+//   * DOM-property writeables Preact's `setProperty` (`src/diff/props.js`)
+//     assigns via the `name in dom` setter path — without these entries,
+//     an attacker can return `h('div', { innerHTML: '<img onerror=…>' })`
+//     and trigger script execution.
+//   * HTMLHyperlinkElementUtils URL-component setters on `<a>` and
+//     `<area>` — `a.href` is sanitized but `a.hostname`, `a.host`,
+//     `a.port`, `a.protocol`, `a.pathname`, `a.search`, `a.hash`,
+//     `a.username`, `a.password` are LIVE setters that rewrite the
+//     URL atomically. Without these, an attacker can render
+//     `h('a', { href: '/safe', hostname: 'evil.example' })` and the
+//     rendered `a.href` becomes `https://evil.example/...` while
+//     `a.getAttribute('href')` still reads `/safe` — a phishing /
+//     open-redirect primitive that visibly looks safe.
+//   * The anchor `text` setter (it's a Node.textContent-style writer
+//     scoped to <a>; same class of attack as `textContent`).
+//   * `attributionSrc` — fires the Attribution Reporting API on click.
+//   * `inert` — disables interaction; UI-DoS only, but blocked for
+//     consistency.
+//
+// The set is intentionally a denylist; a stricter system would use a
+// per-tag attribute allowlist. See "Known gaps" in the README.
 const BLOCKED_PROPS = new Set([
 	'dangerouslySetInnerHTML',
 	'is',
@@ -147,7 +163,21 @@ const BLOCKED_PROPS = new Set([
 	'outerHTML',
 	'textContent',
 	'innerText',
-	'nodeValue'
+	'nodeValue',
+	// HTMLHyperlinkElementUtils setters (live URL rewriters):
+	'hostname',
+	'host',
+	'port',
+	'protocol',
+	'pathname',
+	'search',
+	'hash',
+	'username',
+	'password',
+	// Anchor / area / privacy / UI:
+	'text',
+	'attributionSrc',
+	'inert'
 ]);
 
 const SAFE_URL_RE = /^(?:https?:|mailto:|tel:|sms:|ftp:|\/|\.{0,2}\/|#|\?)/i;
@@ -295,6 +325,33 @@ export function SecureExit(props) {
 // register their own internal boundary types via `_registerTrustedExitType`.
 const trustedExitTypes = new Set([SecureExit]);
 
+// Set of component types that RE-ENTER secure mode even when nested
+// inside a trusted-exit subtree. `preact/compartment` registers each
+// `Confined` wrapper here so that an attacker confined inside a
+// host-trusted island still has its output sanitized — without this,
+// `<SecureExit><Confined/></SecureExit>` would let the attacker
+// render `<script>` and arbitrary JS with full DOM access.
+const secureReentryTypes = new WeakSet();
+
+/**
+ * Register an additional function type as a SECURE-REENTRY boundary.
+ * A vnode whose type is registered here will RESET `trustedExitDepth`
+ * to zero for its subtree (saving the prior value on the vnode and
+ * restoring it on diffed/catchError). Sibling addons like
+ * `preact/compartment` register each `Confined` wrapper they mint so
+ * that an attacker rendered inside a `SecureExit` island still has
+ * its output sanitized.
+ *
+ * SECURITY: any module that calls this can promote a function to a
+ * secure-reentry boundary; the consequence is just that the
+ * function's vnode resets the trusted-exit counter, so this is much
+ * less dangerous than `_registerTrustedExitType`. Still, treat as a
+ * privileged extension point.
+ */
+export function _registerSecureReentryType(fn) {
+	if (typeof fn === 'function') secureReentryTypes.add(fn);
+}
+
 /**
  * Register an additional function type as a trusted-exit boundary.
  * Intended for sibling addons (`preact/compartment`) — NOT to be
@@ -329,9 +386,7 @@ function pushAllowedTags(next) {
 
 function popAllowedTags() {
 	currentAllowedTags =
-		allowedTagsStack.length > 0
-			? allowedTagsStack.pop()
-			: DEFAULT_ALLOWED_TAGS;
+		allowedTagsStack.length > 0 ? allowedTagsStack.pop() : DEFAULT_ALLOWED_TAGS;
 }
 
 function install() {
@@ -375,16 +430,51 @@ function install() {
 	};
 
 	options._render = vnode => {
+		// Each bracket below is idempotent: guarded by a per-vnode flag
+		// that gets cleared on diffed/catchError. This matters because
+		// Preact runs the function-component render in a do-while loop
+		// when the component calls setState synchronously during
+		// render — `_render` would fire N times for the same vnode but
+		// `diffed` only once. Without the guards, `secureRenderDepth`
+		// would grow unboundedly and pollute later host renders.
+		//
+		// Secure-reentry boundary FIRST. Confined wrappers register
+		// themselves here so that an attacker rendered inside a
+		// `SecureExit` island still has its output sanitized.
+		if (
+			vnode.type &&
+			secureReentryTypes.has(vnode.type) &&
+			!vnode._secureBracketed
+		) {
+			vnode._secureBracketed = true;
+			vnode._secureCtx = true;
+			// Save the trusted-exit depth and reset it for this subtree
+			// so the sanitizer re-engages. Restored on diffed/catchError.
+			vnode._savedTrustedExitDepth = trustedExitDepth;
+			trustedExitDepth = 0;
+			const tags =
+				vnode._secureAllowedTags ||
+				(vnode._parent && vnode._parent._secureAllowedTags) ||
+				currentAllowedTags;
+			vnode._secureAllowedTags = tags;
+			pushAllowedTags(tags);
+			secureRenderDepth++;
+		}
 		// Trusted-exit boundary: enter a trusted island, suppress secure
 		// bookkeeping for the subtree. Membership is by IDENTITY against
 		// `trustedExitTypes`, NOT by a `._isSecureExit` flag — an
 		// attacker who sets that flag on their own function cannot
 		// enter this branch.
-		if (vnode.type && trustedExitTypes.has(vnode.type)) {
+		else if (
+			vnode.type &&
+			trustedExitTypes.has(vnode.type) &&
+			!vnode._trustedExitBracketed
+		) {
 			vnode._trustedExitBracketed = true;
 			trustedExitDepth++;
 		} else if (
 			trustedExitDepth === 0 &&
+			!vnode._secureBracketed &&
 			// We deliberately do NOT trust `vnode._secureCtx` on its own here.
 			// That flag is set by our own hooks on real renders, so it's
 			// safe today, but relying on the *parent* / boundary type alone
@@ -407,8 +497,7 @@ function install() {
 			let tags;
 			if (vnode.type === SecureBoundary) {
 				tags =
-					(vnode.props && vnode.props._allowedTags) ||
-					DEFAULT_ALLOWED_TAGS;
+					(vnode.props && vnode.props._allowedTags) || DEFAULT_ALLOWED_TAGS;
 			} else {
 				tags =
 					vnode._secureAllowedTags ||
@@ -427,6 +516,12 @@ function install() {
 			vnode._secureBracketed = false;
 			secureRenderDepth--;
 			popAllowedTags();
+			// If this vnode was a secure-reentry boundary, restore the
+			// trusted-exit depth we saved on _render.
+			if (vnode._savedTrustedExitDepth !== undefined) {
+				trustedExitDepth = vnode._savedTrustedExitDepth;
+				vnode._savedTrustedExitDepth = undefined;
+			}
 		}
 		if (vnode._trustedExitBracketed) {
 			vnode._trustedExitBracketed = false;
@@ -446,6 +541,10 @@ function install() {
 				vnode._secureBracketed = false;
 				secureRenderDepth--;
 				popAllowedTags();
+				if (vnode._savedTrustedExitDepth !== undefined) {
+					trustedExitDepth = vnode._savedTrustedExitDepth;
+					vnode._savedTrustedExitDepth = undefined;
+				}
 			}
 			if (vnode._trustedExitBracketed) {
 				vnode._trustedExitBracketed = false;
@@ -470,11 +569,15 @@ function sanitizeVNode(vnode, allowedTags) {
 
 	if ('ref' in props) delete props.ref;
 
-	for (const key of BLOCKED_PROPS) {
-		if (key in props) delete props[key];
-	}
-
 	if (typeof vnode.type === 'string') {
+		// BLOCKED_PROPS only meaningful on DOM elements — Preact's
+		// `name in dom` setter path only fires for string-tagged
+		// vnodes. Applying the block to function-component vnodes
+		// would clobber legitimate prop names like `text` that a
+		// host or component author might pass through.
+		for (const key of BLOCKED_PROPS) {
+			if (key in props) delete props[key];
+		}
 		const tag = vnode.type.toLowerCase();
 		if (!allowedTags.has(tag)) {
 			vnode.type = Fragment;
@@ -569,9 +672,7 @@ function walkSanitize(node, allowedTags) {
 export function secureRender(vnode, parentDom, opts) {
 	const allowedTags =
 		opts && opts.allowedTags
-			? new Set(
-					Array.from(opts.allowedTags, tag => String(tag).toLowerCase())
-				)
+			? new Set(Array.from(opts.allowedTags, tag => String(tag).toLowerCase()))
 			: DEFAULT_ALLOWED_TAGS;
 	install();
 	walkSanitize(vnode, allowedTags);

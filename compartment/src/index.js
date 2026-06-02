@@ -7,7 +7,11 @@ import {
 	useRef,
 	useReducer
 } from 'preact/hooks';
-import { SecureExit, _registerTrustedExitType } from 'preact/secure';
+import {
+	SecureExit,
+	_registerTrustedExitType,
+	_registerSecureReentryType
+} from 'preact/secure';
 
 /**
  * `preact/compartment` — mount untrusted component code inside a Preact
@@ -28,19 +32,27 @@ import { SecureExit, _registerTrustedExitType } from 'preact/secure';
 // to be a function (it must be another confined component).
 const confinedComponents = new WeakSet();
 
-// Prop names the coercer must drop, regardless of whether `secureRender`
-// is on top. Mirrors `BLOCKED_PROPS` in `preact/secure` and adds `ref`
-// (the secure layer strips refs separately via `vnode.ref = null`, but
-// when the attacker hand-builds the vnode object the ref lives in
-// `props` and the coercer must drop it BEFORE `h()` extracts it onto
-// `vnode.ref` — otherwise plain `preact.render` would attach it).
+// Prop names the coercer drops on EVERY vnode (regardless of whether
+// `secureRender` is on top, and regardless of whether the vnode is a
+// DOM element or a function component). Today this is just `ref` —
+// `h()` extracts `ref` off props onto `vnode.ref`, and the secure
+// layer's sanitizer strips it again, but when the attacker hand-builds
+// a vnode (`{ type:'div', constructor: undefined, props:{ ref: fn }}`)
+// without going through `h()`, the only defense is dropping `ref`
+// here in the coercer.
 //
-// `key` is NOT in this list because the coercer reads it from the
-// vnode directly (defensively) and re-emits it via `rest.key` for
-// `h()` to extract. If the attacker also put `key` in `props`, the
-// vnode-level value wins.
-const DROPPED_PROP_NAMES = new Set([
-	'ref',
+// `key` is intentionally not in this list because the coercer reads
+// it from the vnode directly and re-emits it via `rest.key`; the
+// attacker putting `key` in `props` is harmless (vnode-level wins).
+const DROPPED_PROPS_ALWAYS = new Set(['ref']);
+
+// Prop names the coercer drops only when the vnode renders as a DOM
+// element. These are all reachable through Preact's `name in dom`
+// setter path in `src/diff/props.js`. Function components can
+// legitimately receive a prop named `text` (etc.); blocking it on
+// every vnode would clobber innocent uses. The mirror list in
+// `secure/src/index.js` `BLOCKED_PROPS` has the same scoping rule.
+const DROPPED_PROPS_DOM = new Set([
 	'dangerouslySetInnerHTML',
 	'is',
 	'srcdoc',
@@ -48,7 +60,22 @@ const DROPPED_PROP_NAMES = new Set([
 	'outerHTML',
 	'textContent',
 	'innerText',
-	'nodeValue'
+	'nodeValue',
+	// HTMLHyperlinkElementUtils URL-component setters — see the
+	// `BLOCKED_PROPS` doc comment in `secure/src/index.js` for the
+	// phishing primitive these neutralize.
+	'hostname',
+	'host',
+	'port',
+	'protocol',
+	'pathname',
+	'search',
+	'hash',
+	'username',
+	'password',
+	'text',
+	'attributionSrc',
+	'inert'
 ]);
 
 // Per-render opaque-slot map. `currentSlotMap` points at the slot map of
@@ -176,7 +203,15 @@ function coerceToSafeVNode(value) {
 	// `secureRender` on top (e.g. a unit test).
 
 	const safeType = coerceType(type);
-	const { children, rest } = coerceProps(props);
+	// Only apply the dangerous-prop deny list when the vnode is going to
+	// mount as a DOM element (string-tagged). Function components can
+	// legitimately receive a prop named `text` (etc.); blocking it on
+	// every vnode would clobber attacker-to-attacker or host-to-attacker
+	// prop passing for innocent prop names. Defense remains complete
+	// because every DOM element ultimately renders through a
+	// string-tagged vnode.
+	const dropDom = typeof safeType === 'string';
+	const { children, rest } = coerceProps(props, dropDom);
 	// Surface the key via props so `h()` picks it up — `h` extracts `key`
 	// from props before forwarding to `createVNode`.
 	if (key != null) rest.key = key;
@@ -216,7 +251,16 @@ function coerceType(type) {
 	return Fragment;
 }
 
-function coerceProps(props) {
+/**
+ * @param props      The attacker-returned vnode's props object.
+ * @param dropDom    True when the resulting vnode will render as a DOM
+ *                   element (string-tagged). DOM-specific dangerous
+ *                   prop names are dropped only in that case;
+ *                   function components can receive arbitrary prop
+ *                   names so we don't clobber innocent uses like
+ *                   `text` on a host or attacker component.
+ */
+function coerceProps(props, dropDom) {
 	const rest = {};
 	const children = [];
 	if (props == null || typeof props !== 'object') {
@@ -238,13 +282,11 @@ function coerceProps(props) {
 	}
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
-		// Drop dangerous prop names outright. This is the layer of defense
-		// when the host renders without `secureRender` — without it, an
-		// attacker who hand-builds a vnode `{ type:'div', props:{ ref: fn }}`
-		// would have `ref` re-emitted via `h()` and attached to the live
-		// DOM; or `innerHTML` would be assigned through Preact's
-		// `name in dom` setter path, smuggling raw HTML into the tree.
-		if (DROPPED_PROP_NAMES.has(key)) continue;
+		// Drop dangerous prop names. `ref` is always dropped; the DOM
+		// writeables (innerHTML, hostname, …) only when this vnode will
+		// mount as a DOM element. See the constant comments above.
+		if (DROPPED_PROPS_ALWAYS.has(key)) continue;
+		if (dropDom && DROPPED_PROPS_DOM.has(key)) continue;
 		// `children` is special: split out so we can recursively coerce
 		// and forward as positional `h()` arguments.
 		let value;
@@ -343,10 +385,41 @@ function wrapOpaqueChildren(children) {
 	return sentinels;
 }
 
+// Best-effort detection of SES `lockdown()`. SES exposes `harden` on
+// `globalThis` and freezes `Function.prototype.constructor` so the
+// attacker cannot escape via `endowments.h.constructor('return
+// globalThis')()`. Without lockdown, every function we hand to the
+// attacker exposes the realm's `Function` via its `.constructor`
+// chain and the sandbox is essentially decorative.
+function sesAppearsActive() {
+	return (
+		typeof globalThis !== 'undefined' && typeof globalThis.harden === 'function'
+	);
+}
+
+let warnedNoSes = false;
+function warnIfNoSes() {
+	if (warnedNoSes || sesAppearsActive()) return;
+	warnedNoSes = true;
+	// eslint-disable-next-line no-console
+	if (typeof console !== 'undefined' && console.warn) {
+		console.warn(
+			'preact/compartment: SES `lockdown()` was not detected. The ' +
+				"sandbox's endowments expose `Function` via their " +
+				'`.constructor` chain, so an attacker in the compartment ' +
+				'can reach the host realm via `endowments.h.constructor' +
+				'("return globalThis")()`. Call `lockdown({ overrideTaming: ' +
+				'"severe" })` BEFORE constructing any Compartment.'
+		);
+	}
+}
+
 let installed = false;
 function install() {
 	if (installed) return;
 	installed = true;
+
+	warnIfNoSes();
 
 	// Tell `preact/secure` that `OpaqueChild` is a trusted-exit
 	// boundary. The secure renderer will bracket `trustedExitDepth`
@@ -360,7 +433,16 @@ function install() {
 	const previousCatchError = options._catchError;
 
 	options._render = vnode => {
-		if (vnode.type && confinedComponents.has(vnode.type)) {
+		// Idempotent — `_render` may fire multiple times for the same
+		// vnode when the component calls setState synchronously during
+		// render (Preact's do-while loop in `src/diff/index.js`). The
+		// flag guard means we only push once per vnode lifecycle; the
+		// matching `diffed` (or `_catchError`) pops once.
+		if (
+			vnode.type &&
+			confinedComponents.has(vnode.type) &&
+			!vnode._slotMapBracketed
+		) {
 			vnode._slotMapBracketed = true;
 			pushSlotMap();
 		}
@@ -412,7 +494,8 @@ export function confineComponent(fn, opts) {
 	install();
 	const displayName =
 		(opts && typeof opts.name === 'string' && opts.name) || 'Confined';
-	const onError = opts && typeof opts.onError === 'function' ? opts.onError : null;
+	const onError =
+		opts && typeof opts.onError === 'function' ? opts.onError : null;
 
 	function Confined(rawProps) {
 		// Split host children off and replace with opaque sentinels.
@@ -444,6 +527,11 @@ export function confineComponent(fn, opts) {
 	// through opaque sentinels and `SecureExit` islands at render time.
 	Confined._haltSanitizeChildren = true;
 	confinedComponents.add(Confined);
+	// Register as a secure-reentry boundary so that an attacker confined
+	// inside a `<SecureExit>` island still has its output sanitized.
+	// Without this, `<SecureExit><Confined/></SecureExit>` would let the
+	// attacker render `<script>` and arbitrary JS.
+	_registerSecureReentryType(Confined);
 	return Confined;
 }
 

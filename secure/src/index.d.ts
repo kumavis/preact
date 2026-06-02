@@ -100,3 +100,17 @@ export function unmount(parentDom: ContainerNode): void;
 export const SecureExit: import('preact').FunctionComponent<{
 	children?: ComponentChild;
 }>;
+
+/**
+ * Register an additional function reference as a trusted-exit
+ * boundary. Internal extension point used by `preact/compartment`
+ * to opt `OpaqueChild` in by IDENTITY (without exposing a
+ * forge-able marker flag).
+ *
+ * SECURITY: any module that calls this can promote an arbitrary
+ * function to a trusted-exit type — at which point any vnode of
+ * that type will turn sanitization off for its subtree. Treat this
+ * as a privileged API and only register references owned by
+ * sibling addons, never an attacker-supplied function.
+ */
+export function _registerTrustedExitType(fn: Function): void;

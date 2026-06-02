@@ -1,9 +1,6 @@
 import { createElement, createRef, render } from 'preact';
 import { secureRender, unmount, SecureExit } from 'preact/secure';
-import {
-	confineComponent,
-	isConfinedComponent
-} from 'preact/compartment';
+import { confineComponent, isConfinedComponent } from 'preact/compartment';
 import { setupRerender } from 'preact/test-utils';
 import { setupScratch, teardown } from '../../../test/_util/helpers';
 
@@ -26,7 +23,9 @@ describe('preact/compartment', () => {
 	});
 
 	it('confineComponent returns a Preact function component', () => {
-		const Confined = confineComponent(({ h }, props) => h('div', null, props.title));
+		const Confined = confineComponent(({ h }, props) =>
+			h('div', null, props.title)
+		);
 		expect(typeof Confined).to.equal('function');
 		expect(isConfinedComponent(Confined)).to.equal(true);
 		expect(isConfinedComponent(() => {})).to.equal(false);
@@ -280,7 +279,9 @@ describe('preact/compartment', () => {
 		// The sentinel's type is the OpaqueChild marker, not the host's `span`.
 		expect(firstChildVNode.type).to.not.equal('span');
 		// And the sentinel's own props carry no reference to the host vnode.
-		const ownProps = Object.keys(firstChildVNode.props).filter(k => k !== 'key');
+		const ownProps = Object.keys(firstChildVNode.props).filter(
+			k => k !== 'key'
+		);
 		ownProps.forEach(k => {
 			const v = firstChildVNode.props[k];
 			expect(v && v.type).to.not.equal('span');
@@ -422,9 +423,7 @@ describe('preact/compartment', () => {
 			h(
 				'ul',
 				null,
-				...props.items.map(k =>
-					h('li', { key: k, 'data-k': k }, String(k))
-				)
+				...props.items.map(k => h('li', { key: k, 'data-k': k }, String(k)))
 			)
 		);
 		secureRender(<Confined items={['a', 'b', 'c']} />, scratch);
@@ -625,7 +624,15 @@ describe('preact/compartment', () => {
 		let stolen;
 		const Confined = confineComponent(({ h }) => {
 			function FakeExit() {
-				return h('div', { ref: el => { if (el) stolen = el; } }, 'leak');
+				return h(
+					'div',
+					{
+						ref: el => {
+							if (el) stolen = el;
+						}
+					},
+					'leak'
+				);
 			}
 			FakeExit._isSecureExit = true;
 			return h(FakeExit, null);
@@ -665,7 +672,9 @@ describe('preact/compartment', () => {
 			constructor: undefined,
 			type: 'div',
 			props: {
-				ref: el => { if (el) stolen = el; },
+				ref: el => {
+					if (el) stolen = el;
+				},
 				children: 'x'
 			}
 		}));
@@ -682,7 +691,7 @@ describe('preact/compartment', () => {
 	// used a module-global WeakMap, so an attacker could stash an
 	// `OpaqueChild` reference and a slot from tenant A, then use them
 	// in tenant B's render to resurrect tenant A's host vnode.
-	it('cross-mount slot reuse cannot resurrect another tenant\'s host vnode', () => {
+	it("cross-mount slot reuse cannot resurrect another tenant's host vnode", () => {
 		let stashedOpaque;
 		let stashedSlot;
 		const grabber = confineComponent((endowments, props) => {
@@ -734,5 +743,87 @@ describe('preact/compartment', () => {
 		// In the new design, OpaqueChild returns the realChild or null,
 		// not a wrapped vnode that exposes SecureExit.
 		expect(out).to.equal(null);
+	});
+
+	// Regression: a Confined component nested inside a SecureExit must
+	// re-engage sanitization. The previous code's `options.vnode` and
+	// `options._render` hooks short-circuited whenever
+	// `trustedExitDepth > 0`, so an attacker confined inside a host
+	// `<SecureExit>` island rendered `<script>` and arbitrary JS with
+	// raw DOM events. The fix: Confined wrappers register as
+	// secure-reentry types; their _render resets trustedExitDepth and
+	// re-enters secure mode for the subtree.
+	it('Confined inside SecureExit re-engages sanitization (script blocked)', () => {
+		window.__pwned_in_exit = undefined;
+		const Attacker = confineComponent(({ h }) =>
+			h(
+				'div',
+				null,
+				h('script', null, 'window.__pwned_in_exit = true;'),
+				h('a', { href: 'javascript:alert(1)' }, 'evil-link')
+			)
+		);
+		secureRender(
+			<SecureExit>
+				<Attacker />
+			</SecureExit>,
+			scratch
+		);
+		// <script> replaced with Fragment; its source rendered as text only.
+		expect(scratch.querySelector('script')).to.equal(null);
+		expect(window.__pwned_in_exit).to.equal(undefined);
+		// javascript: URL stripped.
+		const a = scratch.querySelector('a');
+		expect(a.hasAttribute('href')).to.equal(false);
+	});
+
+	it('Confined inside SecureExit still gets SafeEvent (not raw DOM Event)', () => {
+		let captured;
+		const Attacker = confineComponent(({ h }) =>
+			h(
+				'button',
+				{
+					onClick: e => {
+						captured = e;
+					}
+				},
+				'go'
+			)
+		);
+		secureRender(
+			<SecureExit>
+				<Attacker />
+			</SecureExit>,
+			scratch
+		);
+		scratch.querySelector('button').click();
+		expect(captured).to.exist;
+		expect(captured instanceof Event).to.equal(false);
+		// safe target snapshot (not a live Element)
+		expect(captured.target instanceof Element).to.equal(false);
+	});
+
+	// Regression: setState called synchronously inside the attacker's
+	// render fires Preact's do-while loop. Previously, each iteration
+	// would push the slot map / depth bracket without a matching pop,
+	// leaving secureRenderDepth permanently elevated and polluting
+	// later host renders.
+	it('setState-in-render does not leak depth into subsequent renders', () => {
+		const Attacker = confineComponent(({ h, useState }) => {
+			const [n, setN] = useState(0);
+			if (n < 3) setN(n + 1);
+			return h('div', null, 'n=' + n);
+		});
+		secureRender(<Attacker />, scratch);
+
+		// Probe: after the attacker's setState-in-render storm, a plain
+		// preact.render into a separate container with a ref must STILL
+		// receive the live DOM node (i.e., sanitization is off — depth
+		// counter recovered).
+		teardown(scratch);
+		scratch = setupScratch();
+		const ref = createRef();
+		render(<div ref={ref}>x</div>, scratch);
+		expect(ref.current).to.be.instanceof(Element);
 	});
 });

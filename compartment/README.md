@@ -22,6 +22,17 @@ import { secureRender } from 'preact/secure';
 
 ## Quick start
 
+> ⚠️ **SES `lockdown()` is a hard precondition.** Without it, every
+> endowment we hand the attacker exposes the host realm's
+> `Function` via its `.constructor` chain — the attacker can do
+> `endowments.h.constructor('return globalThis')()` and obtain
+> `globalThis`, `document`, `window`, the live DOM tree, and every
+> module the host has imported. `lockdown()` taming neutralizes the
+> `Function` constructor and that escape ceases to exist. The module
+> emits a `console.warn` if it does not detect a successful
+> lockdown. Treat that warning as a security blocker, not a soft
+> reminder.
+
 ```js
 import 'ses';
 
@@ -113,15 +124,26 @@ opaque sentinels. The attacker can position them — `h('header', null,
 props.children[0])` — but cannot read the host vnode they represent,
 because:
 
-- the sentinel's vnode props carry only a frozen empty marker, not
-  the host vnode itself;
-- the host vnode is held in a closure-bound `WeakMap` keyed by the
-  marker, which the attacker has no path to.
+- the sentinel's vnode props carry only a frozen empty marker object,
+  not the host vnode itself;
+- the host vnode is held in a **per-render** `Map` that the renderer
+  scopes via `options._render` / `options.diffed` hooks. The map is
+  `.clear()`-ed and dropped at `diffed`; a slot the attacker stashed
+  in their own state (`useRef`, closure) becomes a useless frozen
+  empty object after the render that issued it completes.
 
-When a sentinel mounts, it routes the original host vnode through a
-`SecureExit` boundary. Sanitization turns off for that subtree — host
-refs work, host event handlers fire with real DOM events, etc. The
-host trusts its own subtree.
+When a sentinel mounts, it returns the original host vnode directly.
+The renderer recognises `OpaqueChild` by IDENTITY as a trusted-exit
+boundary (registered with `preact/secure` at module load) and turns
+sanitization off for that subtree — host refs work, host event
+handlers fire with real DOM events, etc. The host trusts its own
+subtree.
+
+The sentinel deliberately does NOT render a `<SecureExit>`-wrapped
+vnode: that would have let the attacker read `.type` off the
+sentinel's render output and obtain a reusable reference to
+`SecureExit`. With the inline mechanism, no public reference to a
+trusted-exit type ever appears in attacker-reachable JSX.
 
 ### Nesting and lifecycle
 
@@ -133,11 +155,14 @@ host trusts its own subtree.
 - **Confined inside confined works.** A confined component's coercer
   recognises other confined component types and renders them
   normally. Each nested confined level applies its own coercer.
-- **Multi-mount cleanup.** Each render mints fresh opaque sentinels;
-  the WeakMap entries from a previous mount are not consulted on the
-  next. Mounting `Confined` with one set of children, unmounting,
-  and re-mounting with different children renders the new content,
-  not stale content.
+- **Multi-mount cleanup.** Each render mints fresh opaque sentinels
+  in a fresh per-render `Map`. When the diff completes, the map is
+  cleared and dropped. A slot stashed by attacker state from a
+  previous mount no longer resolves; mounting `Confined` with one
+  set of children, unmounting, and re-mounting with different
+  children renders the new content, not stale content. Cross-tenant
+  stashing (Tenant A grabbing a slot, Tenant B trying to render it)
+  is also defeated by this mechanism.
 
 ## Callback props — security note
 

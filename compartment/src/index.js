@@ -44,46 +44,16 @@ const confinedComponents = new WeakSet();
 // `key` is intentionally not in this list because the coercer reads
 // it from the vnode directly and re-emits it via `rest.key`; the
 // attacker putting `key` in `props` is harmless (vnode-level wins).
+//
+// The DOM-specific denylist that used to live alongside this set
+// (`innerHTML`, `srcdoc`, the `HTMLHyperlinkElementUtils` URL
+// setters, …) is gone. The secure layer is now an allow-by-default
+// attribute filter (`DEFAULT_SAFE_ATTRS` in `secure/src/index.js`)
+// and any prop name not on that list — including everything the old
+// `DROPPED_PROPS_DOM` enumerated — is dropped at the secure-renderer
+// boundary. Mounting `confineComponent` WITHOUT `secureRender` on
+// top is documented as unsupported.
 const DROPPED_PROPS_ALWAYS = new Set(['ref']);
-
-// Prop names the coercer drops only when the vnode renders as a DOM
-// element. These are all reachable through Preact's `name in dom`
-// setter path in `src/diff/props.js`. Function components can
-// legitimately receive a prop named `text` (etc.); blocking it on
-// every vnode would clobber innocent uses. The mirror list in
-// `secure/src/index.js` `BLOCKED_PROPS` has the same scoping rule.
-// Entries stored LOWERCASE; the lookup site lowercases the prop key
-// before checking. Critical because the browser's HTML-attribute
-// parsing is case-insensitive while Preact's `name in dom` is
-// case-sensitive — `INNERHTML`, `OnError`, etc. would otherwise reach
-// `setAttribute` and end up as their canonical-cased form in the DOM,
-// triggering inline event handlers or other dangerous content
-// attributes.
-const DROPPED_PROPS_DOM = new Set([
-	'dangerouslysetinnerhtml',
-	'is',
-	'srcdoc',
-	'innerhtml',
-	'outerhtml',
-	'textcontent',
-	'innertext',
-	'nodevalue',
-	// HTMLHyperlinkElementUtils URL-component setters — see the
-	// `BLOCKED_PROPS` doc comment in `secure/src/index.js` for the
-	// phishing primitive these neutralize.
-	'hostname',
-	'host',
-	'port',
-	'protocol',
-	'pathname',
-	'search',
-	'hash',
-	'username',
-	'password',
-	'text',
-	'attributionsrc',
-	'inert'
-]);
 
 // Per-render opaque-slot map. `currentSlotMap` points at the slot map of
 // the confined component currently rendering (or whose subtree is
@@ -224,15 +194,7 @@ function coerceToSafeVNode(value) {
 	// `secureRender` on top (e.g. a unit test).
 
 	const safeType = coerceType(type);
-	// Only apply the dangerous-prop deny list when the vnode is going to
-	// mount as a DOM element (string-tagged). Function components can
-	// legitimately receive a prop named `text` (etc.); blocking it on
-	// every vnode would clobber attacker-to-attacker or host-to-attacker
-	// prop passing for innocent prop names. Defense remains complete
-	// because every DOM element ultimately renders through a
-	// string-tagged vnode.
-	const dropDom = typeof safeType === 'string';
-	const { children, rest } = coerceProps(props, dropDom);
+	const { children, rest } = coerceProps(props);
 	// Surface the key via props so `h()` picks it up — `h` extracts `key`
 	// from props before forwarding to `createVNode`.
 	if (key != null) rest.key = key;
@@ -273,15 +235,17 @@ function coerceType(type) {
 }
 
 /**
- * @param props      The attacker-returned vnode's props object.
- * @param dropDom    True when the resulting vnode will render as a DOM
- *                   element (string-tagged). DOM-specific dangerous
- *                   prop names are dropped only in that case;
- *                   function components can receive arbitrary prop
- *                   names so we don't clobber innocent uses like
- *                   `text` on a host or attacker component.
+ * @param props  The attacker-returned vnode's props object.
+ *
+ * All DOM-specific filtering (`innerHTML`, `srcdoc`, case-variant
+ * `on*`, the HTMLHyperlinkElementUtils URL setters, …) happens
+ * downstream in `preact/secure`'s allow-by-default attribute filter.
+ * This coercer is responsible only for shape (Symbol keys, getters,
+ * Proxy access patterns) and the `ref` field that the secure layer
+ * cannot see when an attacker hand-builds a vnode that bypasses
+ * `h()`.
  */
-function coerceProps(props, dropDom) {
+function coerceProps(props) {
 	const rest = {};
 	const children = [];
 	if (props == null || typeof props !== 'object') {
@@ -303,32 +267,7 @@ function coerceProps(props, dropDom) {
 	}
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
-		// Drop dangerous prop names. `ref` is always dropped; the DOM
-		// writeables (innerHTML, hostname, …) only when this vnode will
-		// mount as a DOM element. Comparison is case-insensitive — the
-		// browser normalizes HTML attribute names to lowercase, so a
-		// case-variant like `INNERHTML` would survive a case-sensitive
-		// `Set.has` check, hit `setAttribute`, and end up applied as
-		// its canonical form.
-		const lower = key.toLowerCase();
-		if (DROPPED_PROPS_ALWAYS.has(lower)) continue;
-		if (dropDom && DROPPED_PROPS_DOM.has(lower)) continue;
-		// On DOM elements, drop case-variant `on*` event-handler keys
-		// outright. Preact's diff is case-sensitive: only canonical
-		// lowercase `on*` is recognised as an event handler and
-		// wrapped via our SafeEvent facade. Case-variants like
-		// `OnError` would otherwise fall through to `setAttribute`,
-		// at which point the browser interprets them as inline event
-		// handlers — full RCE for string values.
-		if (
-			dropDom &&
-			key.length > 2 &&
-			(key.charCodeAt(0) | 0x20) === 0x6f /* o */ &&
-			(key.charCodeAt(1) | 0x20) === 0x6e /* n */ &&
-			(key[0] !== 'o' || key[1] !== 'n')
-		) {
-			continue;
-		}
+		if (DROPPED_PROPS_ALWAYS.has(key.toLowerCase())) continue;
 		// `children` is special: split out so we can recursively coerce
 		// and forward as positional `h()` arguments.
 		let value;

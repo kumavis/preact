@@ -115,83 +115,158 @@ const DEFAULT_ALLOWED_TAGS = new Set([
 	'wbr'
 ]);
 
+// ALLOW-BY-DEFAULT attribute set. Any prop name not on this set, not
+// `on*`, not `aria-*`, and not `data-*` is DROPPED on a DOM-element
+// vnode. This is a structural defense: the previous denylist had to
+// enumerate every dangerous setter (innerHTML, hostname, srcdoc,
+// attributionSrc, …), and every round of review found something new
+// that needed adding. An allowlist inverts the failure mode — the
+// next dangerous setter the browser ships does not become exploitable
+// the moment it lands; the host has to explicitly opt in.
+//
 // Entries stored LOWERCASE; lookup lowercases the prop key. Browsers
-// normalize HTML attribute names to lowercase, so `HREF` /
-// `formAction` / case-variants survive Preact's case-sensitive
-// `name in dom` check, hit `setAttribute(name, value)`, and end up
-// as the canonical lowercase content attribute — `<a HREF="...">`
-// becomes `<a href="...">` at the DOM level.
+// normalize HTML attribute names to lowercase, so a case-variant like
+// `INNERHTML` is also caught (it would otherwise fall through Preact's
+// case-sensitive `name in dom` check, hit `setAttribute`, and land as
+// canonical lowercase in the DOM).
+//
+// Conservative defaults — `form` (the input/button → form-by-id
+// association attribute), `nonce`, `is`, and similar "magic" attrs are
+// intentionally omitted. Hosts that need extras can pass an
+// `allowedAttrs` option to `secureRender` to extend this set for one
+// tree.
+const DEFAULT_SAFE_ATTRS = new Set([
+	// Global content attributes
+	'id',
+	'class',
+	'classname',
+	'title',
+	'lang',
+	'dir',
+	'hidden',
+	'tabindex',
+	'role',
+	'style',
+	'accesskey',
+	'draggable',
+	'spellcheck',
+	'translate',
+	'autocapitalize',
+	'autocorrect',
+	'enterkeyhint',
+	'inputmode',
+	// Form controls
+	'type',
+	'name',
+	'value',
+	'placeholder',
+	'disabled',
+	'required',
+	'readonly',
+	'min',
+	'max',
+	'step',
+	'pattern',
+	'maxlength',
+	'minlength',
+	'size',
+	'multiple',
+	'accept',
+	'checked',
+	'selected',
+	'for',
+	'htmlfor',
+	'autocomplete',
+	'autofocus',
+	// `form` attribute is INTENTIONALLY OMITTED — it associates an
+	// `<input>`/`<button>` with a `<form id="...">` elsewhere in the
+	// document, which would let an attacker submit fields they
+	// authored as part of a host-owned form.
+	// Form submission
+	'enctype',
+	'method',
+	'novalidate',
+	'acceptcharset',
+	'formenctype',
+	'formmethod',
+	'formnovalidate',
+	'formtarget',
+	// Media / images
+	'alt',
+	'width',
+	'height',
+	'loading',
+	'decoding',
+	'crossorigin',
+	'referrerpolicy',
+	'controls',
+	'autoplay',
+	'loop',
+	'muted',
+	'preload',
+	'playsinline',
+	'controlslist',
+	'disableremoteplayback',
+	'disablepictureinpicture',
+	'ismap',
+	// Track
+	'kind',
+	'srclang',
+	'label',
+	'default',
+	// Source / link / media
+	'media',
+	'sizes',
+	// Tables
+	'colspan',
+	'rowspan',
+	'headers',
+	'scope',
+	'abbr',
+	'span',
+	// Lists
+	'start',
+	'reversed',
+	// Time / dialog / details / progress / meter
+	'datetime',
+	'open',
+	'low',
+	'high',
+	'optimum',
+	// Textarea
+	'wrap',
+	'cols',
+	'rows',
+	// Anchor / link
+	'download',
+	'target',
+	'rel',
+	'hreflang',
+	// URL attributes (also in URL_ATTRS for value sanitization)
+	'href',
+	'src',
+	'srcset',
+	'poster',
+	'formaction',
+	'action',
+	'cite',
+	'ping',
+	// Color input (and global)
+	'color'
+]);
+
+// Subset of SAFE_ATTRS whose VALUES must be URL-sanitized. The
+// allowlist gate above admits the prop name; this set gates the
+// value. Lookup is lowercase (the gate already lowercases the key).
 const URL_ATTRS = new Set([
 	'href',
 	'src',
-	'formaction',
-	'action',
 	'srcset',
 	'poster',
+	'formaction',
+	'action',
 	'cite',
-	'data',
-	'background',
-	'ping',
-	'xlinkhref',
-	'xlink:href'
-]);
-
-// Props that must never reach Preact's prop-application path on a DOM
-// element. Beyond the obvious HTML-injection vectors
-// (`dangerouslySetInnerHTML`, `srcdoc`) and the custom-element registration
-// vector (`is`), this set also covers:
-//   * DOM-property writeables Preact's `setProperty` (`src/diff/props.js`)
-//     assigns via the `name in dom` setter path — without these entries,
-//     an attacker can return `h('div', { innerHTML: '<img onerror=…>' })`
-//     and trigger script execution.
-//   * HTMLHyperlinkElementUtils URL-component setters on `<a>` and
-//     `<area>` — `a.href` is sanitized but `a.hostname`, `a.host`,
-//     `a.port`, `a.protocol`, `a.pathname`, `a.search`, `a.hash`,
-//     `a.username`, `a.password` are LIVE setters that rewrite the
-//     URL atomically. Without these, an attacker can render
-//     `h('a', { href: '/safe', hostname: 'evil.example' })` and the
-//     rendered `a.href` becomes `https://evil.example/...` while
-//     `a.getAttribute('href')` still reads `/safe` — a phishing /
-//     open-redirect primitive that visibly looks safe.
-//   * The anchor `text` setter (it's a Node.textContent-style writer
-//     scoped to <a>; same class of attack as `textContent`).
-//   * `attributionSrc` — fires the Attribution Reporting API on click.
-//   * `inert` — disables interaction; UI-DoS only, but blocked for
-//     consistency.
-//
-// The set is intentionally a denylist; a stricter system would use a
-// per-tag attribute allowlist. See "Known gaps" in the README.
-// All entries stored LOWERCASE; the lookup site lowercases the prop
-// key before checking. This is critical because Preact's diff and
-// JS property lookup are case-sensitive, but the browser's
-// HTML-attribute parsing is case-insensitive. An attacker passing
-// `OnError`, `INNERHTML`, `HREF`, etc. would otherwise survive
-// every filter and end up as an inline event handler / dangerous
-// content attribute after `setAttribute(key, value)` (the browser
-// normalizes the attribute name to lowercase).
-const BLOCKED_PROPS = new Set([
-	'dangerouslysetinnerhtml',
-	'is',
-	'srcdoc',
-	'innerhtml',
-	'outerhtml',
-	'textcontent',
-	'innertext',
-	'nodevalue',
-	// HTMLHyperlinkElementUtils setters (live URL rewriters):
-	'hostname',
-	'host',
-	'port',
-	'protocol',
-	'pathname',
-	'search',
-	'hash',
-	'username',
-	'password',
-	// Anchor / area / privacy / UI:
-	'text',
-	'attributionsrc',
-	'inert'
+	'ping'
 ]);
 
 const SAFE_URL_RE = /^(?:https?:|mailto:|tel:|sms:|ftp:|\/|\.{0,2}\/|#|\?)/i;
@@ -409,20 +484,28 @@ let secureRenderDepth = 0;
 // render as ordinary host content.
 let trustedExitDepth = 0;
 
-// Allowlist of the secure tree currently being rendered. Multiple
+// Allowlists for the secure tree currently being rendered. Multiple
 // secure trees can coexist with different allowlists; we keep the
-// previous values on a stack and pop on diffed.
+// previous values on a stack and pop on diffed/catchError. Tags and
+// attrs share a single stack — they always push/pop together, and
+// any divergence would mean a bracket-cleanup bug.
 let currentAllowedTags = DEFAULT_ALLOWED_TAGS;
+let currentSafeAttrs = DEFAULT_SAFE_ATTRS;
 const allowedTagsStack = [];
+const safeAttrsStack = [];
 
-function pushAllowedTags(next) {
+function pushAllowed(nextTags, nextAttrs) {
 	allowedTagsStack.push(currentAllowedTags);
-	currentAllowedTags = next;
+	safeAttrsStack.push(currentSafeAttrs);
+	currentAllowedTags = nextTags;
+	currentSafeAttrs = nextAttrs;
 }
 
-function popAllowedTags() {
+function popAllowed() {
 	currentAllowedTags =
 		allowedTagsStack.length > 0 ? allowedTagsStack.pop() : DEFAULT_ALLOWED_TAGS;
+	currentSafeAttrs =
+		safeAttrsStack.length > 0 ? safeAttrsStack.pop() : DEFAULT_SAFE_ATTRS;
 }
 
 function install() {
@@ -450,17 +533,22 @@ function install() {
 				(vnode._parent && vnode._parent._secureCtx === true))
 		) {
 			vnode._secureCtx = true;
-			// Resolve allowlist: prefer the one cached on the vnode (clone
-			// from a re-render), then the parent's, then the active stack
-			// top. This keeps multiple secure trees with different
-			// allowlists from stepping on each other when their renders
-			// interleave via setState.
+			// Resolve allowlists: prefer the ones cached on the vnode
+			// (clone from a re-render), then the parent's, then the
+			// active stack top. This keeps multiple secure trees with
+			// different allowlists from stepping on each other when their
+			// renders interleave via setState.
 			const tags =
 				vnode._secureAllowedTags ||
 				(vnode._parent && vnode._parent._secureAllowedTags) ||
 				currentAllowedTags;
+			const attrs =
+				vnode._secureSafeAttrs ||
+				(vnode._parent && vnode._parent._secureSafeAttrs) ||
+				currentSafeAttrs;
 			vnode._secureAllowedTags = tags;
-			sanitizeVNode(vnode, tags);
+			vnode._secureSafeAttrs = attrs;
+			sanitizeVNode(vnode, tags, attrs);
 		}
 		if (previousVnode) previousVnode(vnode);
 	};
@@ -507,8 +595,13 @@ function install() {
 				vnode._secureAllowedTags ||
 				(vnode._parent && vnode._parent._secureAllowedTags) ||
 				currentAllowedTags;
+			const attrs =
+				vnode._secureSafeAttrs ||
+				(vnode._parent && vnode._parent._secureSafeAttrs) ||
+				currentSafeAttrs;
 			vnode._secureAllowedTags = tags;
-			pushAllowedTags(tags);
+			vnode._secureSafeAttrs = attrs;
+			pushAllowed(tags, attrs);
 			secureRenderDepth++;
 		}
 		// Trusted-exit boundary: enter a trusted island, suppress secure
@@ -541,22 +634,30 @@ function install() {
 		) {
 			vnode._secureCtx = true;
 			vnode._secureBracketed = true;
-			// Resolve and push the allowlist for the duration of this
+			// Resolve and push the allowlists for the duration of this
 			// component's render. The boundary props carry the per-tree
-			// allowlist; descendants inherit via their parent's cached
-			// `_secureAllowedTags`, surviving renderComponent clones.
+			// allowlists; descendants inherit via their parent's cached
+			// `_secureAllowedTags` / `_secureSafeAttrs`, surviving
+			// renderComponent clones.
 			let tags;
+			let attrs;
 			if (vnode.type === SecureBoundary) {
 				tags =
 					(vnode.props && vnode.props._allowedTags) || DEFAULT_ALLOWED_TAGS;
+				attrs = (vnode.props && vnode.props._safeAttrs) || DEFAULT_SAFE_ATTRS;
 			} else {
 				tags =
 					vnode._secureAllowedTags ||
 					(vnode._parent && vnode._parent._secureAllowedTags) ||
 					currentAllowedTags;
+				attrs =
+					vnode._secureSafeAttrs ||
+					(vnode._parent && vnode._parent._secureSafeAttrs) ||
+					currentSafeAttrs;
 			}
 			vnode._secureAllowedTags = tags;
-			pushAllowedTags(tags);
+			vnode._secureSafeAttrs = attrs;
+			pushAllowed(tags, attrs);
 			secureRenderDepth++;
 		}
 		if (previousRender) previousRender(vnode);
@@ -566,7 +667,7 @@ function install() {
 		if (vnode._secureBracketed) {
 			vnode._secureBracketed = false;
 			secureRenderDepth--;
-			popAllowedTags();
+			popAllowed();
 			// If this vnode was a secure-reentry boundary, restore the
 			// trusted-exit depth we saved on _render.
 			if (vnode._savedTrustedExitDepth !== undefined) {
@@ -591,7 +692,7 @@ function install() {
 			if (vnode._secureBracketed) {
 				vnode._secureBracketed = false;
 				secureRenderDepth--;
-				popAllowedTags();
+				popAllowed();
 				if (vnode._savedTrustedExitDepth !== undefined) {
 					trustedExitDepth = vnode._savedTrustedExitDepth;
 					vnode._savedTrustedExitDepth = undefined;
@@ -612,7 +713,7 @@ function install() {
 	};
 }
 
-function sanitizeVNode(vnode, allowedTags) {
+function sanitizeVNode(vnode, allowedTags, safeAttrs) {
 	if (vnode.ref) vnode.ref = null;
 
 	const props = vnode.props;
@@ -621,33 +722,30 @@ function sanitizeVNode(vnode, allowedTags) {
 	if ('ref' in props) delete props.ref;
 
 	if (typeof vnode.type === 'string') {
-		// BLOCKED_PROPS only meaningful on DOM elements — Preact's
-		// `name in dom` setter path only fires for string-tagged
-		// vnodes. Applying the block to function-component vnodes
-		// would clobber legitimate prop names like `text` that a
-		// host or component author might pass through.
-		// Case-insensitive: BLOCKED_PROPS holds lowercase names; we
-		// lowercase each prop key before lookup so case-variants like
-		// `INNERHTML` are also caught.
-		for (const key in props) {
-			if (BLOCKED_PROPS.has(key.toLowerCase())) {
-				delete props[key];
-			}
-		}
 		const tag = vnode.type.toLowerCase();
 		if (!allowedTags.has(tag)) {
 			vnode.type = Fragment;
 			vnode.props = { children: props.children };
 			return;
 		}
-		sanitizeElementProps(props);
+		// Per-prop sanitization only meaningful on DOM elements —
+		// Preact's `name in dom` setter path and `setAttribute` only
+		// fire for string-tagged vnodes. Function components can
+		// receive arbitrary prop names as data; the allowlist would
+		// strip every legitimate prop name a host passes through.
+		sanitizeElementProps(props, safeAttrs);
 	}
 }
 
-function sanitizeElementProps(props) {
+function sanitizeElementProps(props, safeAttrs) {
 	for (const key in props) {
-		if (key === 'children') continue;
+		// `children` is the subtree, not a DOM attribute. `key` is a
+		// vnode-level field that `h()` already lifted off props; on the
+		// rare hand-built vnode path it may still appear here, but it
+		// is never assigned to the DOM.
+		if (key === 'children' || key === 'key') continue;
 		const value = props[key];
+
 		// Case-INSENSITIVE event-handler detection. Preact's diff and
 		// JS property lookup are case-sensitive, but the browser's
 		// HTML-attribute parsing is case-insensitive: an attacker
@@ -661,10 +759,6 @@ function sanitizeElementProps(props) {
 			const c0 = key.charCodeAt(0) | 0x20; // ASCII lowercase
 			const c1 = key.charCodeAt(1) | 0x20;
 			if (c0 === 0x6f /* o */ && c1 === 0x6e /* n */) {
-				// Anything that isn't the exact canonical lowercase
-				// `on…` form is suspect — drop it. Preact wouldn't
-				// recognise it as an event handler anyway; allowing it
-				// to reach `setAttribute` is the attack.
 				if (key[0] !== 'o' || key[1] !== 'n') {
 					delete props[key];
 					continue;
@@ -678,17 +772,37 @@ function sanitizeElementProps(props) {
 				continue;
 			}
 		}
-		// Case-INSENSITIVE URL-attribute matching. Same reasoning as
-		// above: `<a HREF="javascript:…">` survives
-		// `URL_ATTRS.has('HREF')` (case-sensitive), hits
-		// `setAttribute('HREF', …)`, and the browser registers the
-		// canonical `href` attribute holding the `javascript:` URL —
-		// exploitable on click. We sanitize the value regardless of
-		// the prop key's case; if the value is unsafe we drop the prop
-		// entirely (with its original key). Case variants are left
-		// in place when the value is safe, since `xlinkHref` is a
-		// legitimate camelCase convention.
+
 		const lower = key.toLowerCase();
+
+		// `aria-*` and `data-*` are user-extensible by spec and
+		// considered safe: no live setter behavior, no script
+		// execution. Anything with a non-empty suffix is admitted.
+		// We do not iterate the value, so accessor side effects can
+		// only fire when Preact later reads it — same exposure as
+		// `style` (which is shallow-copied in `preact/compartment`).
+		if (
+			lower.length > 5 &&
+			(lower.indexOf('aria-') === 0 || lower.indexOf('data-') === 0)
+		) {
+			continue;
+		}
+
+		// ALLOWLIST GATE — drop anything not explicitly admitted. This
+		// is the structural defense: new browser-shipped dangerous
+		// setters do not become exploitable until the host opts in.
+		if (!safeAttrs.has(lower)) {
+			delete props[key];
+			continue;
+		}
+
+		// URL value sanitization for allowlisted URL-bearing attrs.
+		// Case-INSENSITIVE: `<a HREF="javascript:…">` survives the
+		// allowlist via the lowercased lookup, then the value gate
+		// blocks the unsafe scheme. If the value is unsafe the prop
+		// is dropped entirely; safe values are written back under the
+		// original key (so legitimate camelCase like `formAction` is
+		// preserved).
 		if (URL_ATTRS.has(lower)) {
 			const sanitized = value == null ? value : sanitizeUrl(value, lower);
 			if (sanitized == null) {
@@ -721,16 +835,19 @@ function wrapListener(userFn) {
  * based hook could see them). State-driven re-renders inside the secure
  * tree are covered by the options.vnode hook.
  */
-function walkSanitize(node, allowedTags) {
+function walkSanitize(node, allowedTags, safeAttrs) {
 	if (Array.isArray(node)) {
-		for (let i = 0; i < node.length; i++) walkSanitize(node[i], allowedTags);
+		for (let i = 0; i < node.length; i++) {
+			walkSanitize(node[i], allowedTags, safeAttrs);
+		}
 		return;
 	}
 	if (!node || typeof node !== 'object' || node.constructor !== undefined) {
 		return;
 	}
-	sanitizeVNode(node, allowedTags);
+	sanitizeVNode(node, allowedTags, safeAttrs);
 	node._secureAllowedTags = allowedTags;
+	node._secureSafeAttrs = safeAttrs;
 	// Stop descending if:
 	//  - the type is a `SecureExit` (its subtree is explicitly trusted)
 	//  - the type advertises that it manages its own children's
@@ -746,7 +863,7 @@ function walkSanitize(node, allowedTags) {
 		return;
 	}
 	const children = node.props && node.props.children;
-	if (children != null) walkSanitize(children, allowedTags);
+	if (children != null) walkSanitize(children, allowedTags, safeAttrs);
 }
 
 /**
@@ -755,20 +872,36 @@ function walkSanitize(node, allowedTags) {
  *
  * @param {*} vnode The vnode to render.
  * @param {Element} parentDom The host-controlled DOM container.
- * @param {{ allowedTags?: Iterable<string> }} [opts]
+ * @param {{ allowedTags?: Iterable<string>, allowedAttrs?: Iterable<string> }} [opts]
+ *   `allowedTags` replaces the default tag allowlist for this tree.
+ *   `allowedAttrs` EXTENDS the default attribute allowlist for this
+ *   tree (additive — the defaults still apply). This is deliberate:
+ *   shrinking the attribute allowlist is rarely useful, while adding
+ *   one or two host-specific attrs (e.g. a custom data-bound name) is
+ *   the common case.
  */
 export function secureRender(vnode, parentDom, opts) {
 	const allowedTags =
 		opts && opts.allowedTags
 			? new Set(Array.from(opts.allowedTags, tag => String(tag).toLowerCase()))
 			: DEFAULT_ALLOWED_TAGS;
+	let safeAttrs = DEFAULT_SAFE_ATTRS;
+	if (opts && opts.allowedAttrs) {
+		safeAttrs = new Set(DEFAULT_SAFE_ATTRS);
+		for (const a of opts.allowedAttrs) safeAttrs.add(String(a).toLowerCase());
+	}
 	install();
-	walkSanitize(vnode, allowedTags);
-	// Stash the per-tree allowlist on the boundary so concurrent secure
-	// trees with different allowlists can coexist. The `_allowedTags`
-	// prop is picked up by `options._render` when the boundary mounts.
+	walkSanitize(vnode, allowedTags, safeAttrs);
+	// Stash the per-tree allowlists on the boundary so concurrent
+	// secure trees with different allowlists can coexist. The
+	// `_allowedTags` / `_safeAttrs` props are picked up by
+	// `options._render` when the boundary mounts.
 	preactRender(
-		h(SecureBoundary, { _allowedTags: allowedTags }, vnode),
+		h(
+			SecureBoundary,
+			{ _allowedTags: allowedTags, _safeAttrs: safeAttrs },
+			vnode
+		),
 		parentDom
 	);
 }

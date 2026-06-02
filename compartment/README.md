@@ -219,23 +219,14 @@ value, it:
      attacker hand-builds a vnode (instead of calling `h()`), `ref`
      lives in `props` and would otherwise be re-emitted onto
      `vnode.ref` by `h()`.
-   - Names in `DROPPED_PROPS_DOM` are skipped only when the vnode
-     will mount as a DOM element. The list mirrors `BLOCKED_PROPS`
-     in `preact/secure` — `dangerouslySetInnerHTML`, `is`, `srcdoc`,
-     `innerHTML`, `outerHTML`, `textContent`, `innerText`,
-     `nodeValue`, the `HTMLHyperlinkElementUtils` URL-component
-     setters (`hostname`, `host`, `port`, `protocol`, `pathname`,
-     `search`, `hash`, `username`, `password`), the anchor `text`
-     setter, `attributionSrc`, and `inert`. Comparison is
-     case-insensitive (set entries are lowercase; the key is
-     lowercased before lookup) so case-variants like `INNERHTML`
-     are blocked too.
-   - Case-variant `on*` event-handler keys (e.g. `OnError`) are
-     dropped on DOM elements. Preact's diff is case-sensitive and
-     only routes canonical lowercase `on*` through its event
-     delegation; case-variants would otherwise fall through to
-     `setAttribute` and the browser would interpret them as inline
-     event handlers — RCE.
+   - All other DOM-specific filtering (`innerHTML`, `srcdoc`, the
+     `HTMLHyperlinkElementUtils` URL-component setters,
+     case-variant `OnError`, `attributionSrc`, `inert`, every
+     unknown attribute name a future browser might ship, …) is
+     handled DOWNSTREAM in `preact/secure`'s allow-by-default
+     `DEFAULT_SAFE_ATTRS` filter. Mounting `confineComponent`
+     WITHOUT `secureRender` on top is unsupported — see "Required
+     environment" above.
    - `style` (when an object) is replaced with a shallow data-only
      copy. Accessor properties are dropped, so getters cannot fire
      side effects while Preact iterates the style to apply it.

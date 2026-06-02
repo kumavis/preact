@@ -4,11 +4,26 @@ export { h, Fragment, createElement } from 'preact';
 
 export interface SecureRenderOptions {
 	/**
-	 * Override the set of HTML tag names that may be rendered. Anything
-	 * outside the list is replaced with a Fragment so the offending element
-	 * disappears while its children continue to render.
+	 * REPLACES the default set of HTML tag names that may be rendered.
+	 * Anything outside the list is replaced with a Fragment so the
+	 * offending element disappears while its children continue to render.
 	 */
 	allowedTags?: Iterable<string>;
+	/**
+	 * EXTENDS the default set of attribute names that may appear on a
+	 * DOM-element vnode. Additive: the built-in `DEFAULT_SAFE_ATTRS`
+	 * (a curated allowlist of ~100 standard HTML attrs) still apply,
+	 * and the entries listed here are added on top for this tree only.
+	 * `aria-*`, `data-*`, and `on*` event handlers are always allowed
+	 * and do not need to be enumerated.
+	 *
+	 * Attribute names are compared CASE-INSENSITIVELY; a host can write
+	 * `tabIndex` and the lookup will hit the lowercase `tabindex`
+	 * entry. Tightening the allowlist (rather than extending) is not
+	 * supported via this option — fork `DEFAULT_SAFE_ATTRS` if you
+	 * need a stricter baseline.
+	 */
+	allowedAttrs?: Iterable<string>;
 }
 
 /**

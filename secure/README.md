@@ -62,21 +62,27 @@ The renderer defends:
    checked, selectedIndex }`) and methods that proxy to the underlying
    event (`preventDefault`, `stopPropagation`,
    `stopImmediatePropagation`).
-3. **HTML injection and live DOM-setter abuse** — `BLOCKED_PROPS`
-   removes a denylist of prop names that would otherwise reach a
-   dangerous setter via Preact's `name in dom` path or via
-   `setAttribute` + browser case normalization. Today this includes
-   `dangerouslySetInnerHTML`, `is`, `srcdoc`, the DOM
-   property writeables `innerHTML` / `outerHTML` / `textContent` /
-   `innerText` / `nodeValue`, the `HTMLHyperlinkElementUtils`
-   URL-component setters (`hostname` / `host` / `port` / `protocol` /
-   `pathname` / `search` / `hash` / `username` / `password`),
-   the anchor `text` setter, `attributionSrc`, and `inert`.
-   Comparison is case-insensitive, so case-variants like `INNERHTML`
-   or `OnError` are also blocked (the browser normalizes attribute
-   names to lowercase, so a case-variant would otherwise survive to
-   `setAttribute` and end up as the canonical-cased content
-   attribute).
+3. **HTML injection and live DOM-setter abuse** — `DEFAULT_SAFE_ATTRS`
+   is an **allow-by-default** attribute filter on DOM elements: any
+   prop name not on the allowlist, not an `on*` handler, and not
+   `aria-*` / `data-*` is dropped. Drops by side-effect include
+   `dangerouslySetInnerHTML`, `is`, `srcdoc`, the DOM property
+   writeables (`innerHTML`, `outerHTML`, `textContent`, `innerText`,
+   `nodeValue`), the `HTMLHyperlinkElementUtils` URL-component
+   setters (`hostname`, `host`, `port`, `protocol`, `pathname`,
+   `search`, `hash`, `username`, `password`), the anchor `text`
+   setter, `attributionSrc`, `inert`, `nonce`, the `form` attribute
+   (cross-form-association attack), and anything else not enumerated.
+   Comparison is case-insensitive — case-variants like `INNERHTML` or
+   `OnError` lowercase to the same lookup key. **The structural
+   benefit:** a newly-shipped browser setter does not become
+   exploitable until the host opts in via `allowedAttrs`.
+
+   **Customization:** `secureRender(vnode, container, { allowedAttrs:
+   ['my-x', 'data-bind-id'] })` extends the default set for one
+   tree. The defaults still apply (additive). To compose multiple
+   secure trees with different allowlists, just call `secureRender`
+   per container — allowlists are stacked per boundary.
 4. **Dangerous element types** — tag names outside a configurable
    allowlist are replaced with `Fragment` so the offending element
    disappears while its children continue to render. The default list
@@ -84,13 +90,16 @@ The renderer defends:
    Excluded by default: `<script>`, `<iframe>`, `<object>`, `<embed>`,
    `<base>`, `<meta>`, `<link>`, `<style>`, plus anything not on the
    list.
-5. **URL scheme injection** — attributes that carry URLs (`href`,
-   `src`, `formaction`, `action`, `srcset`, `poster`, `cite`, `data`,
-   `background`, `ping`, `xlinkHref`) are scheme-checked. Allowed:
-   `https?:`, `mailto:`, `tel:`, `sms:`, `ftp:`, relative paths,
-   fragments, and `data:image/*` for `src`/`poster` only. Everything
-   else (`javascript:`, `vbscript:`, unknown schemes,
-   control-character-prefixed schemes) is dropped.
+5. **URL scheme injection** — URL-bearing attrs that survive the
+   allowlist gate (`href`, `src`, `srcset`, `poster`, `formaction`,
+   `action`, `cite`, `ping`) have their VALUE scheme-checked.
+   Allowed: `https?:`, `mailto:`, `tel:`, `sms:`, `ftp:`, relative
+   paths, fragments, and `data:image/*` for `src`/`poster` only.
+   Everything else (`javascript:`, `vbscript:`, unknown schemes,
+   control-character-prefixed schemes) is dropped. URL-bearing attr
+   names that aren't on the allowlist (`data`, `background`,
+   `xlinkHref`, …) never get to the URL gate — the allowlist drops
+   them first.
 6. **Inline event-handler strings** — `onClick="alert(1)"` (as a
    string value) is rejected; only function-typed handlers reach the
    DOM.
@@ -102,10 +111,19 @@ The renderer defends:
 Render `vnode` into `parentDom` under the sandbox. Re-call with the
 same `parentDom` to update.
 
-`opts.allowedTags` is an iterable of tag names that overrides the
-default allowlist for this tree only. Multiple `secureRender` calls
-with different allowlists can coexist — each tree carries its own
-list, even across state-driven re-renders.
+`opts.allowedTags` is an iterable of tag names that **replaces** the
+default tag allowlist for this tree only.
+
+`opts.allowedAttrs` is an iterable of attribute names that
+**extends** the default attribute allowlist for this tree only —
+additive: the defaults still apply. Tightening the attribute
+allowlist (rather than extending) isn't supported via this option;
+fork `DEFAULT_SAFE_ATTRS` in `src/index.js` if you need a stricter
+baseline.
+
+Multiple `secureRender` calls with different allowlists can coexist
+— each tree carries its own lists, even across state-driven
+re-renders.
 
 ### `unmount(parentDom)`
 
@@ -160,8 +178,11 @@ one of:
 3. **A "strict resources" mode** of this renderer (not yet
    implemented). The hooks in `src/index.js` are small additive
    changes: tighten `URL_ATTRS` to require same-origin / `data:`,
-   strip `ping`, force `rel="noopener noreferrer"` on
-   `target="_blank"`, and pull `form` off the default allowlist.
+   pull `ping`, `download`, `target` off the default allowlist (or
+   override per-tree by passing a custom `allowedAttrs` superset of
+   a stricter baseline), and force `rel="noopener noreferrer"` on
+   `target="_blank"` anchors. The `form` attribute is already off
+   the default allowlist.
 
 ### Sanitization-bypass via cloneElement
 
@@ -201,17 +222,19 @@ currently exposed — file an issue if you need it).
 A call to `secureRender(vnode, parentDom, opts?)` does three things in
 order:
 
-1. Resolves the per-tree allowlist (from `opts.allowedTags` or the
-   default ~80-tag list).
+1. Resolves the per-tree allowlists (tags from `opts.allowedTags`
+   or the default ~80-tag list; attrs from
+   `DEFAULT_SAFE_ATTRS` plus any `opts.allowedAttrs` extensions).
 2. Walks `vnode` once *eagerly* — `walkSanitize` — and strips refs,
-   blocks dangerous props, replaces disallowed tags with Fragments,
-   and scheme-checks URLs. This catches vnodes the host created before
+   drops attrs not on the safe-attrs allowlist, replaces disallowed
+   tags with Fragments, and scheme-checks URLs on allowlisted
+   URL-bearing attrs. This catches vnodes the host created before
    the depth-based options hooks could see them.
 3. Wraps `vnode` in a `SecureBoundary` and hands it to Preact's
    `render`. From then on the option hooks (`vnode`, `_render`,
    `diffed`, `_catchError`) sanitize state-driven re-renders and
-   propagate the per-tree allowlist down via a `_secureAllowedTags`
-   field on each vnode.
+   propagate the per-tree allowlists down via `_secureAllowedTags`
+   and `_secureSafeAttrs` fields cached on each vnode.
 
 The entry-time walk stops descending at two markers:
 

@@ -114,3 +114,20 @@ export const SecureExit: import('preact').FunctionComponent<{
  * sibling addons, never an attacker-supplied function.
  */
 export function _registerTrustedExitType(fn: Function): void;
+
+/**
+ * Register an additional function reference as a SECURE-REENTRY
+ * boundary. A vnode whose type is registered here resets
+ * `trustedExitDepth` to zero for its subtree, restoring it on
+ * diffed/catchError. Used by `preact/compartment` so a `Confined`
+ * mounted inside a `SecureExit` island still has its output
+ * sanitized.
+ *
+ * SECURITY: the consequence of registration is just that
+ * `trustedExitDepth` resets (which *increases* sanitization), so
+ * this is less dangerous than `_registerTrustedExitType`. Throws if
+ * `fn` is already registered as a trusted-exit type — the same
+ * function in both sets would let setState-in-render mix the two
+ * branches and flip sanitization off mid-render.
+ */
+export function _registerSecureReentryType(fn: Function): void;

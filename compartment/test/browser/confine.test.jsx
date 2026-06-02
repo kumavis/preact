@@ -1,4 +1,4 @@
-import { createElement, createRef, render } from 'preact';
+import { createElement, createRef, render, Component } from 'preact';
 import { secureRender, unmount, SecureExit } from 'preact/secure';
 import { confineComponent, isConfinedComponent } from 'preact/compartment';
 import { setupRerender } from 'preact/test-utils';
@@ -920,5 +920,46 @@ describe('preact/compartment', () => {
 		expect(() => _registerSecureReentryType(aFunction)).to.throw(
 			/both a trusted-exit type and a secure-reentry type/
 		);
+	});
+
+	// Regression: an error boundary INSIDE a Confined subtree catches
+	// a deeper child's throw. The bracket-cleanup contract requires
+	// every layer's `_render` push to be matched by a `diffed` or
+	// `_catchError` pop. With an error-boundary swallowing the throw,
+	// the boundary's parent diff continues normally and `diffed` fires
+	// for all bracketed ancestors. After the recovery, a follow-up
+	// host render must observe sanitization in its normal balanced
+	// state (the ref below stays null because we're inside a secure
+	// tree).
+	it('error boundary inside Confined cleans up brackets correctly', () => {
+		class HostBoundary extends Component {
+			constructor(props) {
+				super(props);
+				this.state = { err: null };
+			}
+			componentDidCatch(err) {
+				this.setState({ err: err.message });
+			}
+			render(props, state) {
+				if (state.err)
+					return createElement('span', { class: 'caught' }, state.err);
+				return props.children;
+			}
+		}
+		const Boomer = confineComponent(({ h }) => h(BoomChild));
+		function BoomChild() {
+			throw new Error('boom');
+		}
+		// HostBoundary is host code (outside the confined subtree).
+		// It catches the throw from BoomChild that bubbles up out of
+		// the Confined render.
+		secureRender(
+			createElement(HostBoundary, null, createElement(Boomer, null)),
+			scratch
+		);
+		// Followup host render in the same scratch — must NOT have
+		// inherited any stale depth/exit state from the throw above.
+		secureRender(<div class="after">ok</div>, scratch);
+		expect(scratch.querySelector('.after').textContent).to.equal('ok');
 	});
 });

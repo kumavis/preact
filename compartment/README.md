@@ -32,6 +32,13 @@ import { secureRender } from 'preact/secure';
 > emits a `console.warn` if it does not detect a successful
 > lockdown. Treat that warning as a security blocker, not a soft
 > reminder.
+>
+> Detection is a best-effort heuristic — `typeof globalThis.harden
+> === 'function'`. Any module that defines a global `harden`
+> (e.g. an unrelated deep-freeze polyfill) silences the warning
+> even without a real `lockdown()`. Hosts that rely on the
+> compartment's security guarantees should not depend on the
+> warning alone — call `lockdown()` directly during bootstrap.
 
 ```js
 import 'ses';
@@ -207,16 +214,28 @@ value, it:
    - Symbol-keyed props are dropped — Preact does not consume any
      Symbol-keyed prop, and skipping them prevents accessor getters
      from firing during commit.
-   - Names in a dangerous-prop drop list — `ref`,
-     `dangerouslySetInnerHTML`, `is`, `srcdoc`, `innerHTML`,
-     `outerHTML`, `textContent`, `innerText`, `nodeValue` — are
-     skipped wholesale. `ref` must be dropped here even though the
-     secure layer strips refs, because when the attacker
-     hand-builds a vnode (instead of calling `h()`), `ref` lives in
-     `props` and would otherwise be re-emitted onto `vnode.ref` by
-     `h()`. `innerHTML` and friends are DOM-property writeables
-     Preact's `setProperty` assigns through the `name in dom` path
-     — they would smuggle raw HTML if not blocked.
+   - Names in `DROPPED_PROPS_ALWAYS` (`ref`) are skipped on every
+     vnode. The secure layer also strips `vnode.ref`, but when the
+     attacker hand-builds a vnode (instead of calling `h()`), `ref`
+     lives in `props` and would otherwise be re-emitted onto
+     `vnode.ref` by `h()`.
+   - Names in `DROPPED_PROPS_DOM` are skipped only when the vnode
+     will mount as a DOM element. The list mirrors `BLOCKED_PROPS`
+     in `preact/secure` — `dangerouslySetInnerHTML`, `is`, `srcdoc`,
+     `innerHTML`, `outerHTML`, `textContent`, `innerText`,
+     `nodeValue`, the `HTMLHyperlinkElementUtils` URL-component
+     setters (`hostname`, `host`, `port`, `protocol`, `pathname`,
+     `search`, `hash`, `username`, `password`), the anchor `text`
+     setter, `attributionSrc`, and `inert`. Comparison is
+     case-insensitive (set entries are lowercase; the key is
+     lowercased before lookup) so case-variants like `INNERHTML`
+     are blocked too.
+   - Case-variant `on*` event-handler keys (e.g. `OnError`) are
+     dropped on DOM elements. Preact's diff is case-sensitive and
+     only routes canonical lowercase `on*` through its event
+     delegation; case-variants would otherwise fall through to
+     `setAttribute` and the browser would interpret them as inline
+     event handlers — RCE.
    - `style` (when an object) is replaced with a shallow data-only
      copy. Accessor properties are dropped, so getters cannot fire
      side effects while Preact iterates the style to apply it.

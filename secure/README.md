@@ -62,8 +62,21 @@ The renderer defends:
    checked, selectedIndex }`) and methods that proxy to the underlying
    event (`preventDefault`, `stopPropagation`,
    `stopImmediatePropagation`).
-3. **HTML injection** — `dangerouslySetInnerHTML`, `is`, and `srcdoc`
-   are removed from every props bag in the tree.
+3. **HTML injection and live DOM-setter abuse** — `BLOCKED_PROPS`
+   removes a denylist of prop names that would otherwise reach a
+   dangerous setter via Preact's `name in dom` path or via
+   `setAttribute` + browser case normalization. Today this includes
+   `dangerouslySetInnerHTML`, `is`, `srcdoc`, the DOM
+   property writeables `innerHTML` / `outerHTML` / `textContent` /
+   `innerText` / `nodeValue`, the `HTMLHyperlinkElementUtils`
+   URL-component setters (`hostname` / `host` / `port` / `protocol` /
+   `pathname` / `search` / `hash` / `username` / `password`),
+   the anchor `text` setter, `attributionSrc`, and `inert`.
+   Comparison is case-insensitive, so case-variants like `INNERHTML`
+   or `OnError` are also blocked (the browser normalizes attribute
+   names to lowercase, so a case-variant would otherwise survive to
+   `setAttribute` and end up as the canonical-cased content
+   attribute).
 4. **Dangerous element types** — tag names outside a configurable
    allowlist are replaced with `Fragment` so the offending element
    disappears while its children continue to render. The default list

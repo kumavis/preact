@@ -52,15 +52,22 @@ const DROPPED_PROPS_ALWAYS = new Set(['ref']);
 // legitimately receive a prop named `text` (etc.); blocking it on
 // every vnode would clobber innocent uses. The mirror list in
 // `secure/src/index.js` `BLOCKED_PROPS` has the same scoping rule.
+// Entries stored LOWERCASE; the lookup site lowercases the prop key
+// before checking. Critical because the browser's HTML-attribute
+// parsing is case-insensitive while Preact's `name in dom` is
+// case-sensitive — `INNERHTML`, `OnError`, etc. would otherwise reach
+// `setAttribute` and end up as their canonical-cased form in the DOM,
+// triggering inline event handlers or other dangerous content
+// attributes.
 const DROPPED_PROPS_DOM = new Set([
-	'dangerouslySetInnerHTML',
+	'dangerouslysetinnerhtml',
 	'is',
 	'srcdoc',
-	'innerHTML',
-	'outerHTML',
-	'textContent',
-	'innerText',
-	'nodeValue',
+	'innerhtml',
+	'outerhtml',
+	'textcontent',
+	'innertext',
+	'nodevalue',
 	// HTMLHyperlinkElementUtils URL-component setters — see the
 	// `BLOCKED_PROPS` doc comment in `secure/src/index.js` for the
 	// phishing primitive these neutralize.
@@ -74,7 +81,7 @@ const DROPPED_PROPS_DOM = new Set([
 	'username',
 	'password',
 	'text',
-	'attributionSrc',
+	'attributionsrc',
 	'inert'
 ]);
 
@@ -134,8 +141,22 @@ const endowments = Object.freeze({
  * `type: SecureExit` would let the attacker read `.type` off our
  * output and obtain a reference to `SecureExit` they could re-use to
  * smuggle other content into trusted-exit mode.
+ *
+ * SECURITY: a token (`opaqueChildInvocationToken`) is set from
+ * `options._render` immediately before Preact calls this component
+ * and CONSUMED on first read here. If the attacker stashes the
+ * `OpaqueChild` function and a slot (both reachable via
+ * `props.children[i].{type, props._slot}`) and calls `OpaqueChild`
+ * synchronously inside their render, the token is `null` (only set
+ * for diff-driven calls) and we return `null`. Without this guard
+ * the attacker could exfil the host vnode object as a JS value and
+ * walk its tree / invoke host component functions to escalate to
+ * host-authority code execution.
  */
+let opaqueChildInvocationToken = null;
 function OpaqueChild(props) {
+	if (opaqueChildInvocationToken !== props) return null;
+	opaqueChildInvocationToken = null;
 	const real = currentSlotMap && currentSlotMap.get(props._slot);
 	return real == null ? null : real;
 }
@@ -284,9 +305,30 @@ function coerceProps(props, dropDom) {
 		const key = keys[i];
 		// Drop dangerous prop names. `ref` is always dropped; the DOM
 		// writeables (innerHTML, hostname, …) only when this vnode will
-		// mount as a DOM element. See the constant comments above.
-		if (DROPPED_PROPS_ALWAYS.has(key)) continue;
-		if (dropDom && DROPPED_PROPS_DOM.has(key)) continue;
+		// mount as a DOM element. Comparison is case-insensitive — the
+		// browser normalizes HTML attribute names to lowercase, so a
+		// case-variant like `INNERHTML` would survive a case-sensitive
+		// `Set.has` check, hit `setAttribute`, and end up applied as
+		// its canonical form.
+		const lower = key.toLowerCase();
+		if (DROPPED_PROPS_ALWAYS.has(lower)) continue;
+		if (dropDom && DROPPED_PROPS_DOM.has(lower)) continue;
+		// On DOM elements, drop case-variant `on*` event-handler keys
+		// outright. Preact's diff is case-sensitive: only canonical
+		// lowercase `on*` is recognised as an event handler and
+		// wrapped via our SafeEvent facade. Case-variants like
+		// `OnError` would otherwise fall through to `setAttribute`,
+		// at which point the browser interprets them as inline event
+		// handlers — full RCE for string values.
+		if (
+			dropDom &&
+			key.length > 2 &&
+			(key.charCodeAt(0) | 0x20) === 0x6f /* o */ &&
+			(key.charCodeAt(1) | 0x20) === 0x6e /* n */ &&
+			(key[0] !== 'o' || key[1] !== 'n')
+		) {
+			continue;
+		}
 		// `children` is special: split out so we can recursively coerce
 		// and forward as positional `h()` arguments.
 		let value;
@@ -445,6 +487,16 @@ function install() {
 		) {
 			vnode._slotMapBracketed = true;
 			pushSlotMap();
+		}
+		// Token-set for `OpaqueChild`: only diff-driven calls to the
+		// component get to resolve their slot. Set to the SAME `props`
+		// object Preact is about to pass — `OpaqueChild` confirms it
+		// received that exact bag and consumes the token. Without this,
+		// an attacker who stashed `OpaqueChild` + a slot could call
+		// `OpaqueChild({_slot})` directly and exfil the host vnode as
+		// a JS return value.
+		if (vnode.type === OpaqueChild) {
+			opaqueChildInvocationToken = vnode.props;
 		}
 		if (previousRender) previousRender(vnode);
 	};

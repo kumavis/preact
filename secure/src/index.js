@@ -115,6 +115,12 @@ const DEFAULT_ALLOWED_TAGS = new Set([
 	'wbr'
 ]);
 
+// Entries stored LOWERCASE; lookup lowercases the prop key. Browsers
+// normalize HTML attribute names to lowercase, so `HREF` /
+// `formAction` / case-variants survive Preact's case-sensitive
+// `name in dom` check, hit `setAttribute(name, value)`, and end up
+// as the canonical lowercase content attribute — `<a HREF="...">`
+// becomes `<a href="...">` at the DOM level.
 const URL_ATTRS = new Set([
 	'href',
 	'src',
@@ -126,7 +132,7 @@ const URL_ATTRS = new Set([
 	'data',
 	'background',
 	'ping',
-	'xlinkHref',
+	'xlinkhref',
 	'xlink:href'
 ]);
 
@@ -155,15 +161,23 @@ const URL_ATTRS = new Set([
 //
 // The set is intentionally a denylist; a stricter system would use a
 // per-tag attribute allowlist. See "Known gaps" in the README.
+// All entries stored LOWERCASE; the lookup site lowercases the prop
+// key before checking. This is critical because Preact's diff and
+// JS property lookup are case-sensitive, but the browser's
+// HTML-attribute parsing is case-insensitive. An attacker passing
+// `OnError`, `INNERHTML`, `HREF`, etc. would otherwise survive
+// every filter and end up as an inline event handler / dangerous
+// content attribute after `setAttribute(key, value)` (the browser
+// normalizes the attribute name to lowercase).
 const BLOCKED_PROPS = new Set([
-	'dangerouslySetInnerHTML',
+	'dangerouslysetinnerhtml',
 	'is',
 	'srcdoc',
-	'innerHTML',
-	'outerHTML',
-	'textContent',
-	'innerText',
-	'nodeValue',
+	'innerhtml',
+	'outerhtml',
+	'textcontent',
+	'innertext',
+	'nodevalue',
 	// HTMLHyperlinkElementUtils setters (live URL rewriters):
 	'hostname',
 	'host',
@@ -176,7 +190,7 @@ const BLOCKED_PROPS = new Set([
 	'password',
 	// Anchor / area / privacy / UI:
 	'text',
-	'attributionSrc',
+	'attributionsrc',
 	'inert'
 ]);
 
@@ -349,7 +363,22 @@ const secureReentryTypes = new WeakSet();
  * privileged extension point.
  */
 export function _registerSecureReentryType(fn) {
-	if (typeof fn === 'function') secureReentryTypes.add(fn);
+	if (typeof fn !== 'function') return;
+	// Mutual exclusion: registering the same function in both sets
+	// would let setState-in-render iterate `_render` such that the
+	// first iteration takes the secure-reentry branch (sets
+	// `_secureBracketed`) and the second takes the trusted-exit
+	// branch (sets `_trustedExitBracketed`), at which point the
+	// second iteration's render runs with `trustedExitDepth > 0` and
+	// sanitization off. Throwing prevents the dual-registration foot-
+	// gun outright.
+	if (trustedExitTypes.has(fn)) {
+		throw new Error(
+			'preact/secure: cannot register a function as both a ' +
+				'trusted-exit type and a secure-reentry type.'
+		);
+	}
+	secureReentryTypes.add(fn);
 }
 
 /**
@@ -359,7 +388,14 @@ export function _registerSecureReentryType(fn) {
  * function would expose the trusted-exit branch.
  */
 export function _registerTrustedExitType(fn) {
-	if (typeof fn === 'function') trustedExitTypes.add(fn);
+	if (typeof fn !== 'function') return;
+	if (secureReentryTypes.has(fn)) {
+		throw new Error(
+			'preact/secure: cannot register a function as both a ' +
+				'trusted-exit type and a secure-reentry type.'
+		);
+	}
+	trustedExitTypes.add(fn);
 }
 
 let installed = false;
@@ -430,6 +466,21 @@ function install() {
 	};
 
 	options._render = vnode => {
+		// Top-level idempotency guard: if THIS vnode already entered
+		// ANY of our brackets in a prior `_render` call, never enter
+		// another one. Preact's diff fires `_render` once per render
+		// invocation, and on setState-in-render it loops `c.render()`
+		// up to 25 times. Without this guard, a vnode whose type was
+		// (incorrectly) registered in both `secureReentryTypes` AND
+		// `trustedExitTypes` would take the reentry branch on
+		// iteration 1 and the trusted-exit branch on iteration 2,
+		// flipping sanitization off for the rest of the render. The
+		// per-branch `!_*Bracketed` guards below also work, but this
+		// top-level check is the strongest defense-in-depth.
+		if (vnode._secureBracketed || vnode._trustedExitBracketed) {
+			if (previousRender) previousRender(vnode);
+			return;
+		}
 		// Each bracket below is idempotent: guarded by a per-vnode flag
 		// that gets cleared on diffed/catchError. This matters because
 		// Preact runs the function-component render in a do-while loop
@@ -575,8 +626,13 @@ function sanitizeVNode(vnode, allowedTags) {
 		// vnodes. Applying the block to function-component vnodes
 		// would clobber legitimate prop names like `text` that a
 		// host or component author might pass through.
-		for (const key of BLOCKED_PROPS) {
-			if (key in props) delete props[key];
+		// Case-insensitive: BLOCKED_PROPS holds lowercase names; we
+		// lowercase each prop key before lookup so case-variants like
+		// `INNERHTML` are also caught.
+		for (const key in props) {
+			if (BLOCKED_PROPS.has(key.toLowerCase())) {
+				delete props[key];
+			}
 		}
 		const tag = vnode.type.toLowerCase();
 		if (!allowedTags.has(tag)) {
@@ -592,17 +648,49 @@ function sanitizeElementProps(props) {
 	for (const key in props) {
 		if (key === 'children') continue;
 		const value = props[key];
-		if (key.length > 2 && key[0] === 'o' && key[1] === 'n') {
-			if (value == null) continue;
-			if (typeof value !== 'function') {
-				delete props[key];
+		// Case-INSENSITIVE event-handler detection. Preact's diff and
+		// JS property lookup are case-sensitive, but the browser's
+		// HTML-attribute parsing is case-insensitive: an attacker
+		// passing `OnError` survives Preact's `name[0]=='o' &&
+		// name[1]=='n'` check, falls through to `setAttribute(name,
+		// value)`, and the browser registers an `onerror` content
+		// attribute that runs the string as JS. We drop case-variant
+		// on-handlers entirely (only canonical lowercase `on*` is
+		// honored).
+		if (key.length > 2) {
+			const c0 = key.charCodeAt(0) | 0x20; // ASCII lowercase
+			const c1 = key.charCodeAt(1) | 0x20;
+			if (c0 === 0x6f /* o */ && c1 === 0x6e /* n */) {
+				// Anything that isn't the exact canonical lowercase
+				// `on…` form is suspect — drop it. Preact wouldn't
+				// recognise it as an event handler anyway; allowing it
+				// to reach `setAttribute` is the attack.
+				if (key[0] !== 'o' || key[1] !== 'n') {
+					delete props[key];
+					continue;
+				}
+				if (value == null) continue;
+				if (typeof value !== 'function') {
+					delete props[key];
+					continue;
+				}
+				props[key] = wrapListener(value);
 				continue;
 			}
-			props[key] = wrapListener(value);
-			continue;
 		}
-		if (URL_ATTRS.has(key)) {
-			const sanitized = value == null ? value : sanitizeUrl(value, key);
+		// Case-INSENSITIVE URL-attribute matching. Same reasoning as
+		// above: `<a HREF="javascript:…">` survives
+		// `URL_ATTRS.has('HREF')` (case-sensitive), hits
+		// `setAttribute('HREF', …)`, and the browser registers the
+		// canonical `href` attribute holding the `javascript:` URL —
+		// exploitable on click. We sanitize the value regardless of
+		// the prop key's case; if the value is unsafe we drop the prop
+		// entirely (with its original key). Case variants are left
+		// in place when the value is safe, since `xlinkHref` is a
+		// legitimate camelCase convention.
+		const lower = key.toLowerCase();
+		if (URL_ATTRS.has(lower)) {
+			const sanitized = value == null ? value : sanitizeUrl(value, lower);
 			if (sanitized == null) {
 				delete props[key];
 			} else {

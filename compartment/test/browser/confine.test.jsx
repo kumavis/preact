@@ -826,4 +826,99 @@ describe('preact/compartment', () => {
 		render(<div ref={ref}>x</div>, scratch);
 		expect(ref.current).to.be.instanceof(Element);
 	});
+
+	// Regression: case-variant event handlers (e.g. `OnError`) used to
+	// bypass our `on*` detection (case-sensitive `o`+`n` check) and
+	// Preact's `name in dom` lookup (also case-sensitive), then survive
+	// to `setAttribute('OnError', value)` — at which point the browser
+	// normalizes to the canonical `onerror` content attribute and parses
+	// the value as inline JS (full RCE).
+	it('case-variant event handlers (OnError, OnLoad) are dropped', () => {
+		window.__pwned_case = undefined;
+		const Attacker = confineComponent(({ h }) =>
+			h('img', {
+				src: 'http://127.0.0.1:1/__404__',
+				OnError: 'window.__pwned_case = 1;',
+				OnLoad: 'window.__pwned_case = 2;',
+				oNERROR: 'window.__pwned_case = 3;'
+			})
+		);
+		secureRender(<Attacker />, scratch);
+		const img = scratch.querySelector('img');
+		expect(img.hasAttribute('onerror')).to.equal(false);
+		expect(img.hasAttribute('onload')).to.equal(false);
+		expect(img.hasAttribute('OnError')).to.equal(false);
+		// Give the img a chance to fail to load and fire the event.
+		return new Promise(resolve => setTimeout(resolve, 100)).then(() => {
+			expect(window.__pwned_case).to.equal(undefined);
+		});
+	});
+
+	// Regression: case-variant URL attributes (e.g. `HREF`) used to
+	// bypass URL_ATTRS scheme validation (case-sensitive), get
+	// `setAttribute('HREF', 'javascript:...')`, and end up as the
+	// canonical `href` content attribute the browser uses on click.
+	it('case-variant URL attributes are scheme-checked', () => {
+		const Attacker = confineComponent(({ h }) =>
+			h(
+				'div',
+				null,
+				h('a', { HREF: 'javascript:window.__pwned_url=1' }, 'evil1'),
+				h('a', { Href: 'javascript:window.__pwned_url=2' }, 'evil2')
+			)
+		);
+		secureRender(<Attacker />, scratch);
+		const anchors = scratch.querySelectorAll('a');
+		for (const a of anchors) {
+			// No case-variant href attribute survived.
+			expect(a.hasAttribute('href')).to.equal(false);
+			expect(a.hasAttribute('HREF')).to.equal(false);
+			expect(a.hasAttribute('Href')).to.equal(false);
+			expect(a.href).to.equal('');
+		}
+	});
+
+	// Regression: OpaqueChild called directly as a function used to
+	// return the host vnode, letting the attacker walk the host
+	// vnode tree and invoke host component closures.
+	it('OpaqueChild direct call does not leak the host vnode', () => {
+		let leaked = 'untouched';
+		const Attacker = confineComponent((_endowments, props) => {
+			const sentinel = props.children[0];
+			// Attacker has the OpaqueChild function and a valid slot.
+			// Call it directly. The token guard means this returns null
+			// instead of the host vnode.
+			try {
+				leaked = sentinel.type({ _slot: sentinel.props._slot });
+			} catch (_) {
+				leaked = '__threw__';
+			}
+			return null;
+		});
+		// Build a host child whose vnode object we can inspect for
+		// leakage. The vnode has `type === 'span'` — if the attacker
+		// got it, `leaked.type === 'span'`.
+		secureRender(
+			<Attacker>
+				<span class="hostsecret">SECRET</span>
+			</Attacker>,
+			scratch
+		);
+		expect(leaked).to.equal(null);
+	});
+
+	// Regression: `_registerTrustedExitType` and
+	// `_registerSecureReentryType` must refuse to put the same
+	// function in both sets. Without mutual exclusion, a setState-in-
+	// render loop could enter the reentry branch on iter 1 and the
+	// trusted-exit branch on iter 2, flipping sanitization off.
+	it('cannot register a function as both trusted-exit and secure-reentry', async () => {
+		const { _registerTrustedExitType, _registerSecureReentryType } =
+			await import('preact/secure');
+		function aFunction() {}
+		_registerTrustedExitType(aFunction);
+		expect(() => _registerSecureReentryType(aFunction)).to.throw(
+			/both a trusted-exit type and a secure-reentry type/
+		);
+	});
 });

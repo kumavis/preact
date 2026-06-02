@@ -1,4 +1,4 @@
-import { FunctionComponent } from 'preact';
+import { ComponentChildren, FunctionComponent } from 'preact';
 
 /**
  * Bundle of utilities handed to the attacker function as its first
@@ -26,7 +26,7 @@ export interface CompartmentEndowments {
  * `onSubmit` callback) is callable by the attacker with arbitrary
  * arguments. Host code MUST treat those arguments as untrusted JSON.
  */
-export type ConfinedProps<P extends object = {}> = Readonly<P> & {
+export type ConfinedProps<P extends object = {}> = Readonly<Omit<P, 'children'>> & {
 	readonly children?: readonly unknown[] | undefined;
 };
 
@@ -50,7 +50,7 @@ export interface ConfineOptions {
 export function confineComponent<P extends object = {}>(
 	fn: (endowments: CompartmentEndowments, props: ConfinedProps<P>) => unknown,
 	opts?: ConfineOptions
-): FunctionComponent<P>;
+): FunctionComponent<Omit<P, 'children'> & { children?: ComponentChildren }>;
 
 /** Returns true if `value` is a wrapper returned by `confineComponent`. */
 export function isConfinedComponent(value: unknown): boolean;

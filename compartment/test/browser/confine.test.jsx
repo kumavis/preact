@@ -617,4 +617,122 @@ describe('preact/compartment', () => {
 		// The element rendered as a side effect of normal preact render.
 		expect(scratch.querySelector('.attacker').textContent).to.equal('x');
 	});
+
+	// Regression: forged `_isSecureExit` flag must not bump the secure
+	// renderer's trustedExitDepth. Identity check on `SecureExit` is the
+	// only trust gate; flags can be set by attacker code.
+	it('refuses to enter trusted-exit mode on attacker-flagged function', () => {
+		let stolen;
+		const Confined = confineComponent(({ h }) => {
+			function FakeExit() {
+				return h('div', { ref: el => { if (el) stolen = el; } }, 'leak');
+			}
+			FakeExit._isSecureExit = true;
+			return h(FakeExit, null);
+		});
+		secureRender(<Confined />, scratch);
+		// FakeExit was rejected by coerceType (replaced with Fragment),
+		// so its body never ran. Even if it had, the renderer's identity
+		// gate on `trustedExitTypes` would refuse the bracket.
+		expect(stolen).to.equal(undefined);
+	});
+
+	// Regression: forged `_isSecureBoundary` flag must not let attacker
+	// pick the allowlist for its subtree.
+	it('refuses to honor attacker-flagged _isSecureBoundary', () => {
+		const Confined = confineComponent(({ h }) => {
+			function FakeBoundary(props) {
+				return props.children;
+			}
+			FakeBoundary._isSecureBoundary = true;
+			return h(
+				FakeBoundary,
+				{ _allowedTags: new Set(['script', 'div']) },
+				h('script', null, 'window.__SCRIPT_RAN = true')
+			);
+		});
+		window.__SCRIPT_RAN = undefined;
+		secureRender(<Confined />, scratch);
+		expect(window.__SCRIPT_RAN).to.equal(undefined);
+		expect(scratch.querySelector('script')).to.equal(null);
+	});
+
+	// Regression: coercer must drop `ref` from a HAND-BUILT vnode where
+	// the attacker put ref in `props` (not via `h()`).
+	it('drops ref from attacker hand-built vnode props (no secureRender path)', () => {
+		let stolen;
+		const Confined = confineComponent(() => ({
+			constructor: undefined,
+			type: 'div',
+			props: {
+				ref: el => { if (el) stolen = el; },
+				children: 'x'
+			}
+		}));
+		// Use plain preact.render (no secureRender) — the coercer is the
+		// only defense in this mode. The previous code copied `ref`
+		// through `Object.keys(props)` and `h('div', rest, …)` extracted
+		// it onto vnode.ref. The fix: `coerceProps` drops `ref`.
+		render(<Confined />, scratch);
+		expect(stolen).to.equal(undefined);
+		expect(scratch.querySelector('div').textContent).to.equal('x');
+	});
+
+	// Regression: cross-mount opaque-slot reuse. The previous design
+	// used a module-global WeakMap, so an attacker could stash an
+	// `OpaqueChild` reference and a slot from tenant A, then use them
+	// in tenant B's render to resurrect tenant A's host vnode.
+	it('cross-mount slot reuse cannot resurrect another tenant\'s host vnode', () => {
+		let stashedOpaque;
+		let stashedSlot;
+		const grabber = confineComponent((endowments, props) => {
+			stashedOpaque = props.children[0].type;
+			stashedSlot = props.children[0].props._slot;
+			return null;
+		});
+		secureRender(
+			<grabber>
+				<div class="secret-from-A">SECRET-A</div>
+			</grabber>,
+			scratch
+		);
+
+		teardown(scratch);
+		scratch = setupScratch();
+
+		const attacker = confineComponent((endowments, _props) =>
+			endowments.h(stashedOpaque, { _slot: stashedSlot })
+		);
+		secureRender(<attacker />, scratch);
+		// The OLD slot map was cleared on diffed(grabber); the new map
+		// (for the attacker confined) has no entry for stashedSlot.
+		expect(scratch.querySelector('.secret-from-A')).to.equal(null);
+	});
+
+	// Regression: SecureExit reference must not be extractable by the
+	// attacker via OpaqueChild's render output. Previously OpaqueChild
+	// returned `h(SecureExit, null, …)` — calling it manually exposed
+	// the SecureExit function on the returned vnode's `.type`. The fix:
+	// OpaqueChild returns the realChild directly; trusted-exit semantics
+	// arrive via secure's identity check on OpaqueChild itself.
+	it('OpaqueChild render does not expose SecureExit via its output', () => {
+		let openOpaqueChild;
+		const Confined = confineComponent(({ h }, props) => {
+			openOpaqueChild = props.children[0].type;
+			return h('span', null, 'visible');
+		});
+		secureRender(
+			<Confined>
+				<span>host</span>
+			</Confined>,
+			scratch
+		);
+		// Call OpaqueChild manually with a non-matching slot so we get
+		// the slot-miss path. We must NOT see a SecureExit-typed vnode
+		// in its output.
+		const out = openOpaqueChild({ _slot: Object.freeze({}) });
+		// In the new design, OpaqueChild returns the realChild or null,
+		// not a wrapped vnode that exposes SecureExit.
+		expect(out).to.equal(null);
+	});
 });

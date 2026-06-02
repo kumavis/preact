@@ -163,19 +163,35 @@ value, it:
 4. Reads `value.type`, `value.props`, `value.key` once each, each in
    its own try/catch — getter throws abort the value, not the host
    render.
-5. Coerces `type`:
+5. Coerces `type` by IDENTITY (not by flag):
    - String tags pass through (the secure renderer applies the
      allowlist).
-   - `Fragment`, `SecureExit`, `SecureBoundary`, `OpaqueChild`, and
-     any other `confineComponent`-wrapped function are accepted as
-     component types.
-   - Anything else becomes `Fragment` so children still render.
+   - The `Fragment` reference passes through.
+   - The internal `OpaqueChild` reference passes through (so an
+     attacker can position the host children they were handed).
+   - Functions in the `confinedComponents` WeakSet (i.e. wrappers we
+     minted via `confineComponent`) pass through, supporting nested
+     confinement.
+   - Anything else — including a function the attacker hand-flagged
+     with `_isSecureExit`, `_isSecureBoundary`, etc. — becomes
+     `Fragment` so the children still render. This is a deliberate
+     defense against forged trust gates.
 6. Coerces props:
    - Keys are read via `Object.keys` (falls back to
      `Reflect.ownKeys` filtered to strings if `Object.keys` throws).
    - Symbol-keyed props are dropped — Preact does not consume any
      Symbol-keyed prop, and skipping them prevents accessor getters
      from firing during commit.
+   - Names in a dangerous-prop drop list — `ref`,
+     `dangerouslySetInnerHTML`, `is`, `srcdoc`, `innerHTML`,
+     `outerHTML`, `textContent`, `innerText`, `nodeValue` — are
+     skipped wholesale. `ref` must be dropped here even though the
+     secure layer strips refs, because when the attacker
+     hand-builds a vnode (instead of calling `h()`), `ref` lives in
+     `props` and would otherwise be re-emitted onto `vnode.ref` by
+     `h()`. `innerHTML` and friends are DOM-property writeables
+     Preact's `setProperty` assigns through the `name in dom` path
+     — they would smuggle raw HTML if not blocked.
    - `style` (when an object) is replaced with a shallow data-only
      copy. Accessor properties are dropped, so getters cannot fire
      side effects while Preact iterates the style to apply it.

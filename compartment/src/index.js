@@ -1,4 +1,4 @@
-import { h, Fragment } from 'preact';
+import { h, Fragment, options } from 'preact';
 import {
 	useState,
 	useEffect,
@@ -7,7 +7,7 @@ import {
 	useRef,
 	useReducer
 } from 'preact/hooks';
-import { SecureExit } from 'preact/secure';
+import { SecureExit, _registerTrustedExitType } from 'preact/secure';
 
 /**
  * `preact/compartment` — mount untrusted component code inside a Preact
@@ -28,9 +28,53 @@ import { SecureExit } from 'preact/secure';
 // to be a function (it must be another confined component).
 const confinedComponents = new WeakSet();
 
-// Host vnode trapped behind an opaque sentinel. Lookup is closure-based:
-// the sentinel vnode itself exposes no property carrying the host vnode.
-const opaqueRealChildren = new WeakMap();
+// Prop names the coercer must drop, regardless of whether `secureRender`
+// is on top. Mirrors `BLOCKED_PROPS` in `preact/secure` and adds `ref`
+// (the secure layer strips refs separately via `vnode.ref = null`, but
+// when the attacker hand-builds the vnode object the ref lives in
+// `props` and the coercer must drop it BEFORE `h()` extracts it onto
+// `vnode.ref` — otherwise plain `preact.render` would attach it).
+//
+// `key` is NOT in this list because the coercer reads it from the
+// vnode directly (defensively) and re-emits it via `rest.key` for
+// `h()` to extract. If the attacker also put `key` in `props`, the
+// vnode-level value wins.
+const DROPPED_PROP_NAMES = new Set([
+	'ref',
+	'dangerouslySetInnerHTML',
+	'is',
+	'srcdoc',
+	'innerHTML',
+	'outerHTML',
+	'textContent',
+	'innerText',
+	'nodeValue'
+]);
+
+// Per-render opaque-slot map. `currentSlotMap` points at the slot map of
+// the confined component currently rendering (or whose subtree is
+// currently diffing). It's bracketed by our `options._render` /
+// `options.diffed` hooks; when the diff for a confined component finishes
+// we `.clear()` the map AND drop the reference, so a slot the attacker
+// stashed in their own state (across renders or compartments) becomes
+// useless — the host vnode it once pointed to is no longer reachable.
+//
+// IMPORTANT: this replaces a previous module-global `WeakMap` that allowed
+// an attacker who stashed (OpaqueChild type, slot) from tenant A to
+// resurrect tenant A's host vnode inside tenant B's tree. See the
+// `cross-mount slot reuse` test for the regression.
+let currentSlotMap = null;
+const slotMapStack = [];
+
+function pushSlotMap() {
+	slotMapStack.push(currentSlotMap);
+	currentSlotMap = new Map();
+}
+
+function popSlotMap() {
+	if (currentSlotMap) currentSlotMap.clear();
+	currentSlotMap = slotMapStack.length > 0 ? slotMapStack.pop() : null;
+}
 
 /**
  * Frozen bundle of utilities handed to the attacker function as its
@@ -52,14 +96,22 @@ const endowments = Object.freeze({
 /**
  * Component placed inline by `Confined` to mark a slot where one of the
  * host's children should render. The sentinel's vnode carries no own
- * property pointing at the real child — the link is held in a closure
- * and a module-level WeakMap, both unreachable by the attacker.
+ * property pointing at the real child — the link is held in a per-render
+ * `currentSlotMap` keyed by the slot object, unreachable by the
+ * attacker.
+ *
+ * `OpaqueChild` itself is registered as a trusted-exit boundary with
+ * `preact/secure` (see `install()`), so the host vnode it returns
+ * renders without sanitization. Crucially: we return the host vnode
+ * DIRECTLY, not wrapped in `<SecureExit>`. Returning a vnode with
+ * `type: SecureExit` would let the attacker read `.type` off our
+ * output and obtain a reference to `SecureExit` they could re-use to
+ * smuggle other content into trusted-exit mode.
  */
 function OpaqueChild(props) {
-	const real = opaqueRealChildren.get(props._slot);
-	return h(SecureExit, null, real == null ? null : real);
+	const real = currentSlotMap && currentSlotMap.get(props._slot);
+	return real == null ? null : real;
 }
-OpaqueChild._isOpaqueChild = true;
 
 /**
  * Walk an arbitrary value returned by the attacker and re-create it
@@ -141,15 +193,21 @@ function coerceType(type) {
 		return type;
 	}
 	if (typeof type === 'function') {
-		// Only allow known-safe component functions: confined wrappers,
-		// the Fragment, the opaque-child slot, and the SecureExit
-		// boundary itself.
-		if (
-			confinedComponents.has(type) ||
-			type._isOpaqueChild === true ||
-			type._isSecureExit === true ||
-			type._isSecureBoundary === true
-		) {
+		// Identity-based allowlist of attacker-usable component types.
+		// We deliberately do NOT trust `_isOpaqueChild` / `_isSecureExit`
+		// / `_isSecureBoundary` flags — an attacker can set those on
+		// their own function and pass through this gate (the documented
+		// CVE class from the original release). Identity is checked
+		// against the actual `OpaqueChild` reference and the
+		// `confinedComponents` WeakSet of wrappers we minted.
+		//
+		// SecureExit and SecureBoundary are deliberately NOT in this
+		// allowlist — the attacker has no legitimate path to obtain
+		// either reference (SecureExit is no longer exposed via
+		// OpaqueChild's render output; SecureBoundary is module-private
+		// to secure). Trusted-exit semantics arrive through `OpaqueChild`
+		// itself, which is registered with secure as a trusted-exit type.
+		if (confinedComponents.has(type) || type === OpaqueChild) {
 			return type;
 		}
 	}
@@ -180,6 +238,13 @@ function coerceProps(props) {
 	}
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
+		// Drop dangerous prop names outright. This is the layer of defense
+		// when the host renders without `secureRender` — without it, an
+		// attacker who hand-builds a vnode `{ type:'div', props:{ ref: fn }}`
+		// would have `ref` re-emitted via `h()` and attached to the live
+		// DOM; or `innerHTML` would be assigned through Preact's
+		// `name in dom` setter path, smuggling raw HTML into the tree.
+		if (DROPPED_PROP_NAMES.has(key)) continue;
 		// `children` is special: split out so we can recursively coerce
 		// and forward as positional `h()` arguments.
 		let value;
@@ -265,12 +330,64 @@ function wrapOpaqueChildren(children) {
 	const sentinels = [];
 	for (let i = 0; i < list.length; i++) {
 		// Each slot is a unique object so multiple host children can be
-		// looked up independently in the WeakMap.
+		// looked up independently. The slot is registered into the
+		// CURRENT confined component's slot map (set up by the
+		// `options._render` hook below). When that render's diff
+		// completes (`options.diffed`), the map is `.clear()`-ed and
+		// dropped — slots the attacker stashed in their own state
+		// become useless.
 		const slot = Object.freeze({});
-		opaqueRealChildren.set(slot, list[i]);
+		if (currentSlotMap) currentSlotMap.set(slot, list[i]);
 		sentinels.push(h(OpaqueChild, { _slot: slot, key: i }));
 	}
 	return sentinels;
+}
+
+let installed = false;
+function install() {
+	if (installed) return;
+	installed = true;
+
+	// Tell `preact/secure` that `OpaqueChild` is a trusted-exit
+	// boundary. The secure renderer will bracket `trustedExitDepth`
+	// around its diff so the host child it returns renders without
+	// sanitization — refs work, raw events fire, etc. — restoring the
+	// behavior the previous code achieved by wrapping in `<SecureExit>`.
+	_registerTrustedExitType(OpaqueChild);
+
+	const previousRender = options._render;
+	const previousDiffed = options.diffed;
+	const previousCatchError = options._catchError;
+
+	options._render = vnode => {
+		if (vnode.type && confinedComponents.has(vnode.type)) {
+			vnode._slotMapBracketed = true;
+			pushSlotMap();
+		}
+		if (previousRender) previousRender(vnode);
+	};
+
+	options.diffed = vnode => {
+		if (vnode._slotMapBracketed) {
+			vnode._slotMapBracketed = false;
+			popSlotMap();
+		}
+		if (previousDiffed) previousDiffed(vnode);
+	};
+
+	// On an unhandled render exception, `options.diffed` doesn't fire
+	// — clean up the slot-map bracket here so the next render starts
+	// from a balanced state.
+	options._catchError = (error, vnode, oldVNode, errorInfo) => {
+		if (vnode && vnode._slotMapBracketed) {
+			vnode._slotMapBracketed = false;
+			popSlotMap();
+		}
+		if (previousCatchError) {
+			return previousCatchError(error, vnode, oldVNode, errorInfo);
+		}
+		throw error;
+	};
 }
 
 /**
@@ -292,6 +409,7 @@ export function confineComponent(fn, opts) {
 	if (typeof fn !== 'function') {
 		throw new TypeError('confineComponent: expected a function');
 	}
+	install();
 	const displayName =
 		(opts && typeof opts.name === 'string' && opts.name) || 'Confined';
 	const onError = opts && typeof opts.onError === 'function' ? opts.onError : null;

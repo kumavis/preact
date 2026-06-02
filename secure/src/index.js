@@ -130,7 +130,25 @@ const URL_ATTRS = new Set([
 	'xlink:href'
 ]);
 
-const BLOCKED_PROPS = new Set(['dangerouslySetInnerHTML', 'is', 'srcdoc']);
+// Props that must never reach Preact's prop-application path on a DOM
+// element. Beyond the obvious HTML-injection vectors
+// (`dangerouslySetInnerHTML`, `srcdoc`) and the custom-element registration
+// vector (`is`), this set also covers the DOM-property writeables
+// (`innerHTML`, `outerHTML`, `textContent`, `innerText`, `nodeValue`) that
+// Preact's `setProperty` (`src/diff/props.js`) assigns via the `name in
+// dom` setter path — without this entry, an attacker can return
+// `h('div', { innerHTML: '<img onerror=…>' })` and trigger script
+// execution.
+const BLOCKED_PROPS = new Set([
+	'dangerouslySetInnerHTML',
+	'is',
+	'srcdoc',
+	'innerHTML',
+	'outerHTML',
+	'textContent',
+	'innerText',
+	'nodeValue'
+]);
 
 const SAFE_URL_RE = /^(?:https?:|mailto:|tel:|sms:|ftp:|\/|\.{0,2}\/|#|\?)/i;
 const SAFE_DATA_IMG_RE =
@@ -256,7 +274,9 @@ function makeSafeEvent(e) {
 function SecureBoundary(props) {
 	return props.children;
 }
-SecureBoundary._isSecureBoundary = true;
+// SecureBoundary is module-private and is detected by identity in the
+// `_render` hook; no flag is necessary, and exposing one would be a
+// forge-able trust gate.
 
 /**
  * Inverse of `SecureBoundary`: anything rendered below this component is
@@ -267,7 +287,23 @@ SecureBoundary._isSecureBoundary = true;
 export function SecureExit(props) {
 	return props.children;
 }
-SecureExit._isSecureExit = true;
+
+// Set of component types that act as trusted-exit boundaries. Membership
+// is by IDENTITY, not by flag — an attacker who sets
+// `myFn._isSecureExit = true` on their own function cannot enter the
+// trusted-exit branch this way. Add-on layers (`preact/compartment`)
+// register their own internal boundary types via `_registerTrustedExitType`.
+const trustedExitTypes = new Set([SecureExit]);
+
+/**
+ * Register an additional function type as a trusted-exit boundary.
+ * Intended for sibling addons (`preact/compartment`) — NOT to be
+ * imported by attacker code. Calling this with an attacker-controlled
+ * function would expose the trusted-exit branch.
+ */
+export function _registerTrustedExitType(fn) {
+	if (typeof fn === 'function') trustedExitTypes.add(fn);
+}
 
 let installed = false;
 
@@ -339,10 +375,12 @@ function install() {
 	};
 
 	options._render = vnode => {
-		// SecureExit boundary: enter a trusted island, suppress secure
-		// bookkeeping for the subtree. This branch wins even when nested
-		// inside a secure tree — the whole point is to opt out.
-		if (vnode.type && vnode.type._isSecureExit === true) {
+		// Trusted-exit boundary: enter a trusted island, suppress secure
+		// bookkeeping for the subtree. Membership is by IDENTITY against
+		// `trustedExitTypes`, NOT by a `._isSecureExit` flag — an
+		// attacker who sets that flag on their own function cannot
+		// enter this branch.
+		if (vnode.type && trustedExitTypes.has(vnode.type)) {
 			vnode._trustedExitBracketed = true;
 			trustedExitDepth++;
 		} else if (
@@ -353,7 +391,10 @@ function install() {
 			// keeps the gate from getting opened by a pre-flagged vnode if
 			// some future code path mounts a vnode without going through
 			// the coercer.
-			((vnode.type && vnode.type._isSecureBoundary === true) ||
+			// Boundary detection is also identity-based: SecureBoundary
+			// is module-private so attacker code has no way to obtain
+			// the reference.
+			(vnode.type === SecureBoundary ||
 				(vnode._parent && vnode._parent._secureCtx === true) ||
 				secureRenderDepth > 0)
 		) {
@@ -364,7 +405,7 @@ function install() {
 			// allowlist; descendants inherit via their parent's cached
 			// `_secureAllowedTags`, surviving renderComponent clones.
 			let tags;
-			if (vnode.type && vnode.type._isSecureBoundary === true) {
+			if (vnode.type === SecureBoundary) {
 				tags =
 					(vnode.props && vnode.props._allowedTags) ||
 					DEFAULT_ALLOWED_TAGS;
@@ -411,7 +452,13 @@ function install() {
 				trustedExitDepth--;
 			}
 		}
-		return previousCatchError(error, vnode, oldVNode, errorInfo);
+		// `options._catchError` is *usually* installed by preact itself
+		// (default: `_catchError` from `./diff/catch-error`), but guard
+		// in case a host has cleared it.
+		if (previousCatchError) {
+			return previousCatchError(error, vnode, oldVNode, errorInfo);
+		}
+		throw error;
 	};
 }
 
@@ -503,7 +550,7 @@ function walkSanitize(node, allowedTags) {
 	const type = node.type;
 	if (
 		type &&
-		(type._isSecureExit === true || type._haltSanitizeChildren === true)
+		(trustedExitTypes.has(type) || type._haltSanitizeChildren === true)
 	) {
 		return;
 	}

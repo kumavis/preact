@@ -182,7 +182,9 @@ const DEFAULT_SAFE_ATTRS = new Set([
 	// `<input>`/`<button>` with a `<form id="...">` elsewhere in the
 	// document, which would let an attacker submit fields they
 	// authored as part of a host-owned form.
-	// Form submission
+	// Form submission. `formtarget` is INTENTIONALLY OMITTED — see
+	// the `target`/`download` comment block below for the
+	// browsing-context-escape attack class.
 	'enctype',
 	'method',
 	'novalidate',
@@ -190,7 +192,6 @@ const DEFAULT_SAFE_ATTRS = new Set([
 	'formenctype',
 	'formmethod',
 	'formnovalidate',
-	'formtarget',
 	// Media / images
 	'alt',
 	'width',
@@ -238,8 +239,15 @@ const DEFAULT_SAFE_ATTRS = new Set([
 	'cols',
 	'rows',
 	// Anchor / link
-	'download',
-	'target',
+	// `target`, `formtarget`, and `download` are INTENTIONALLY
+	// OMITTED from the defaults. `target="_top"` / `_parent` breaks
+	// out of an iframe sandbox; `target="_blank"` without
+	// `rel="noopener noreferrer"` leaks `window.opener` to the new
+	// tab. `download` combined with an allowed `href` to the host's
+	// origin lets the attacker suggest a hostile filename for a
+	// host-served file (download-phishing). Hosts that legitimately
+	// need any of these can opt in via `allowedAttrs` knowing the
+	// trade-off.
 	'rel',
 	'hreflang',
 	// URL attributes (also in URL_ATTRS for value sanitization)
@@ -254,6 +262,65 @@ const DEFAULT_SAFE_ATTRS = new Set([
 	// Color input (and global)
 	'color'
 ]);
+
+// Hard-deny: names a host's `allowedAttrs` extension may NEVER opt
+// in. The allowlist is meant for extensions like custom data-
+// shaped attrs or framework-specific markers — not for re-enabling
+// the attacks the default set was designed to block. Throwing on
+// these turns a config typo (or an attacker who controls a CMS-
+// driven allowlist) from a silent XSS into a CI failure.
+//
+// Includes:
+//   * the empty string (would admit anything that lowercases to '')
+//   * `on` (length-2 bypass of the `key.length > 2` event check)
+//   * every name in `on*` form (event handlers must route through
+//     `wrapListener`; an allowlist entry would skip the wrapper)
+//   * HTML-injection sinks (innerHTML, srcdoc, …)
+//   * HTMLHyperlinkElementUtils live URL-component setters
+//   * `is` (custom-element registration), `nonce` (CSP bypass),
+//     `attributionsrc` (privacy beacon), `inert` (UI-DoS),
+//     `text` (anchor textContent-equivalent)
+const HARD_DENY_ATTRS = new Set([
+	'',
+	'on',
+	'innerhtml',
+	'outerhtml',
+	'srcdoc',
+	'dangerouslysetinnerhtml',
+	'textcontent',
+	'innertext',
+	'nodevalue',
+	'hostname',
+	'host',
+	'port',
+	'protocol',
+	'pathname',
+	'search',
+	'hash',
+	'username',
+	'password',
+	'text',
+	'attributionsrc',
+	'inert',
+	'nonce',
+	'is'
+]);
+
+function isHardDeniedAttr(lower) {
+	if (HARD_DENY_ATTRS.has(lower)) return true;
+	// Block every `on*` form, including length-2 `on` (already in
+	// the set above for completeness) and arbitrary suffixes. The
+	// renderer's event path routes through `wrapListener`; an
+	// allowlist entry would bypass it.
+	if (
+		lower.length >= 2 &&
+		lower.charCodeAt(0) === 0x6f /* o */ &&
+		lower.charCodeAt(1) === 0x6e /* n */
+	) {
+		return true;
+	}
+	return false;
+}
 
 // Subset of SAFE_ATTRS whose VALUES must be URL-sanitized. The
 // allowlist gate above admits the prop name; this set gates the
@@ -281,6 +348,32 @@ function sanitizeUrl(value, attr) {
 		return value;
 	}
 	return null;
+}
+
+// `ping` is a SPACE-separated URL list and `srcset` is a
+// COMMA-separated `<url> <descriptor>` list. `sanitizeUrl` checks
+// only the leading prefix of its argument, so without a list-aware
+// path, `<a ping="/safe https://attacker/log">` and `<img
+// srcset="/safe.png 1x, https://attacker/track 2x">` smuggle
+// secondary URLs straight through — the browser fires requests to
+// each. Returns the original string if every URL in the list passes
+// individually, null if any fails.
+function sanitizeUrlList(value, attr) {
+	if (typeof value !== 'string') return null;
+	// `srcset`: comma-separated candidate strings. For each, the URL
+	// is the first whitespace-bounded token; whatever follows is the
+	// descriptor (e.g. `2x`, `300w`).
+	// `ping`: space-separated URL list.
+	const parts = attr === 'srcset' ? value.split(',') : value.split(/\s+/);
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i].trim();
+		if (part === '') continue; // tolerate empty entries from extra whitespace/commas
+		const url = attr === 'srcset' ? part.split(/\s+/)[0] : part;
+		if (sanitizeUrl(url, attr === 'srcset' ? 'src' : attr) == null) {
+			return null;
+		}
+	}
+	return value;
 }
 
 const KEY_PROPS = [
@@ -479,6 +572,18 @@ let installed = false;
 // every newly created vnode is sanitized.
 let secureRenderDepth = 0;
 
+// How deep we are specifically inside a `SecureBoundary`-rooted
+// subtree (i.e. one that originated from a `secureRender` call). This
+// is DISTINCT from `secureRenderDepth` because secure-reentry
+// boundaries (e.g. `confineComponent` wrappers via
+// `_registerSecureReentryType`) also bump `secureRenderDepth` —
+// even when no SecureBoundary is on the stack. Sibling addons use
+// `_isInSecureContext()` to detect "am I REALLY rendering inside a
+// secureRender tree", and we don't want a secure-reentry self-
+// bracket to give the answer "yes" when the host actually mounted
+// the addon under plain `preact/render`.
+let secureBoundaryDepth = 0;
+
 // How deep we are inside a SecureExit's render call(s). When > 0, the
 // sanitizer no-ops and `_secureCtx` does not propagate, so descendants
 // render as ordinary host content.
@@ -603,6 +708,27 @@ function install() {
 			vnode._secureSafeAttrs = attrs;
 			pushAllowed(tags, attrs);
 			secureRenderDepth++;
+			// `_isInSecureContext()` must return true for sibling
+			// addons (the very thing the reentry branch exists to
+			// support) when the secure-reentry vnode is rendering
+			// inside a real `secureRender` subtree. Detection is by
+			// PARENT identity: the boundary branch (below) stamps
+			// `_secureCtx` on every vnode it brackets, including the
+			// SecureBoundary itself, and Preact's diff sets
+			// `vnode._parent` to the parent vnode by the time
+			// `options._render` fires here. A setState-driven
+			// re-render reuses the same vnode object — so
+			// `_parent._secureCtx` survives across re-renders without
+			// needing the SecureBoundary's `_render` to re-fire.
+			//
+			// For a Confined rendered via plain `preact/render`,
+			// `vnode._parent` points at the wrapping Fragment whose
+			// `_secureCtx` was never set — the bump does not happen
+			// and the fail-fast in the addon's render fires.
+			if (vnode._parent && vnode._parent._secureCtx === true) {
+				vnode._secureBoundaryBracketed = true;
+				secureBoundaryDepth++;
+			}
 		}
 		// Trusted-exit boundary: enter a trusted island, suppress secure
 		// bookkeeping for the subtree. Membership is by IDENTITY against
@@ -634,6 +760,16 @@ function install() {
 		) {
 			vnode._secureCtx = true;
 			vnode._secureBracketed = true;
+			// Mark this vnode as a SecureBoundary-tree bracket (NOT a
+			// secure-reentry bracket). `_isInSecureContext` consults
+			// `secureBoundaryDepth` to decide whether a sibling addon
+			// (e.g. `confineComponent`) is rendering inside a real
+			// `secureRender` subtree; reentry brackets must NOT bump
+			// that counter, otherwise a Confined mounted via plain
+			// `preact/render` would self-certify as "in secure
+			// context".
+			vnode._secureBoundaryBracketed = true;
+			secureBoundaryDepth++;
 			// Resolve and push the allowlists for the duration of this
 			// component's render. The boundary props carry the per-tree
 			// allowlists; descendants inherit via their parent's cached
@@ -675,6 +811,10 @@ function install() {
 				vnode._savedTrustedExitDepth = undefined;
 			}
 		}
+		if (vnode._secureBoundaryBracketed) {
+			vnode._secureBoundaryBracketed = false;
+			secureBoundaryDepth--;
+		}
 		if (vnode._trustedExitBracketed) {
 			vnode._trustedExitBracketed = false;
 			trustedExitDepth--;
@@ -698,6 +838,10 @@ function install() {
 					vnode._savedTrustedExitDepth = undefined;
 				}
 			}
+			if (vnode._secureBoundaryBracketed) {
+				vnode._secureBoundaryBracketed = false;
+				secureBoundaryDepth--;
+			}
 			if (vnode._trustedExitBracketed) {
 				vnode._trustedExitBracketed = false;
 				trustedExitDepth--;
@@ -719,13 +863,28 @@ function sanitizeVNode(vnode, allowedTags, safeAttrs) {
 	const props = vnode.props;
 	if (!props || typeof props !== 'object') return;
 
-	if ('ref' in props) delete props.ref;
-
 	if (typeof vnode.type === 'string') {
 		const tag = vnode.type.toLowerCase();
 		if (!allowedTags.has(tag)) {
 			vnode.type = Fragment;
-			vnode.props = { children: props.children };
+			// `props.children` is read via direct property access, which
+			// would resolve an inherited `children` if the own slot is
+			// absent. To stay consistent with the rest of the
+			// allow-by-default model, use Object.hasOwn so a polluted
+			// `Object.prototype.children` cannot smuggle a tree into a
+			// Fragment-replaced subtree.
+			const ownChildren = Object.prototype.hasOwnProperty.call(
+				props,
+				'children'
+			)
+				? props.children
+				: undefined;
+			// Fresh null-proto bag so the downstream Preact diff's
+			// `for (i in newProps)` cannot pick up Object.prototype
+			// pollution on attribute-shaped keys.
+			const out = Object.create(null);
+			if (ownChildren !== undefined) out.children = ownChildren;
+			vnode.props = out;
 			return;
 		}
 		// Per-prop sanitization only meaningful on DOM elements —
@@ -733,18 +892,56 @@ function sanitizeVNode(vnode, allowedTags, safeAttrs) {
 		// fire for string-tagged vnodes. Function components can
 		// receive arbitrary prop names as data; the allowlist would
 		// strip every legitimate prop name a host passes through.
-		sanitizeElementProps(props, safeAttrs);
+		vnode.props = sanitizeElementProps(props, safeAttrs);
+	}
+	// Function component: leave props as-is (the renderer doesn't
+	// write them to the DOM directly), but null out any own `ref`
+	// slot. We do NOT iterate the prototype chain — function
+	// components legitimately consume rich, structured props bags,
+	// and rebuilding them would break host code.
+	else if (Object.prototype.hasOwnProperty.call(props, 'ref')) {
+		delete props.ref;
 	}
 }
 
+// Build a fresh null-prototype props bag containing only the
+// allowlisted keys. This is the critical structural defense: the
+// previous version mutated `props` in place via `for...in` +
+// `delete`, which is a no-op for INHERITED keys. A pollution gadget
+// elsewhere on the host page (`Object.prototype.innerHTML = …`,
+// `Object.prototype.dangerouslySetInnerHTML = …`) would otherwise
+// turn every secure render into HTML injection, because Preact's
+// own diff also iterates `for (i in newProps)` and the inherited
+// key reaches `setProperty`. Building `out` from
+// `Object.getOwnPropertyNames(props)` + `Object.create(null)` means
+// (a) we only consider own enumerable props during the gate, and
+// (b) the returned object has NO prototype, so Preact's downstream
+// `for...in` walks no inherited keys.
 function sanitizeElementProps(props, safeAttrs) {
-	for (const key in props) {
-		// `children` is the subtree, not a DOM attribute. `key` is a
-		// vnode-level field that `h()` already lifted off props; on the
-		// rare hand-built vnode path it may still appear here, but it
-		// is never assigned to the DOM.
-		if (key === 'children' || key === 'key') continue;
-		const value = props[key];
+	const out = Object.create(null);
+	let forceNoopener = false;
+	const keys = Object.getOwnPropertyNames(props);
+	for (let i = 0; i < keys.length; i++) {
+		const key = keys[i];
+		// `children` is the subtree, not a DOM attribute; preserve.
+		if (key === 'children') {
+			out.children = props.children;
+			continue;
+		}
+		// `ref` and `key` are vnode-level — `h()` already lifted them
+		// off props in the normal path, and any straggler on a
+		// hand-built vnode must not reach the DOM. Drop both.
+		if (key === 'ref' || key === 'key') continue;
+
+		let value;
+		try {
+			value = props[key];
+		} catch (_) {
+			// A hostile getter on the attacker's prop bag is a
+			// shape-only attack; skip rather than propagate the throw
+			// into Preact's diff.
+			continue;
+		}
 
 		// Case-INSENSITIVE event-handler detection. Preact's diff and
 		// JS property lookup are case-sensitive, but the browser's
@@ -752,23 +949,16 @@ function sanitizeElementProps(props, safeAttrs) {
 		// passing `OnError` survives Preact's `name[0]=='o' &&
 		// name[1]=='n'` check, falls through to `setAttribute(name,
 		// value)`, and the browser registers an `onerror` content
-		// attribute that runs the string as JS. We drop case-variant
-		// on-handlers entirely (only canonical lowercase `on*` is
-		// honored).
+		// attribute that runs the string as JS. Only canonical
+		// lowercase `on*` is honored; case-variants are dropped.
 		if (key.length > 2) {
 			const c0 = key.charCodeAt(0) | 0x20; // ASCII lowercase
 			const c1 = key.charCodeAt(1) | 0x20;
 			if (c0 === 0x6f /* o */ && c1 === 0x6e /* n */) {
-				if (key[0] !== 'o' || key[1] !== 'n') {
-					delete props[key];
-					continue;
-				}
+				if (key[0] !== 'o' || key[1] !== 'n') continue;
 				if (value == null) continue;
-				if (typeof value !== 'function') {
-					delete props[key];
-					continue;
-				}
-				props[key] = wrapListener(value);
+				if (typeof value !== 'function') continue;
+				out[key] = wrapListener(value);
 				continue;
 			}
 		}
@@ -777,41 +967,69 @@ function sanitizeElementProps(props, safeAttrs) {
 
 		// `aria-*` and `data-*` are user-extensible by spec and
 		// considered safe: no live setter behavior, no script
-		// execution. Anything with a non-empty suffix is admitted.
-		// We do not iterate the value, so accessor side effects can
-		// only fire when Preact later reads it — same exposure as
-		// `style` (which is shallow-copied in `preact/compartment`).
+		// execution. Require a non-empty suffix to avoid admitting
+		// bare `aria-` / `data-`.
 		if (
 			lower.length > 5 &&
 			(lower.indexOf('aria-') === 0 || lower.indexOf('data-') === 0)
 		) {
+			out[key] = value;
 			continue;
 		}
 
-		// ALLOWLIST GATE — drop anything not explicitly admitted. This
-		// is the structural defense: new browser-shipped dangerous
-		// setters do not become exploitable until the host opts in.
-		if (!safeAttrs.has(lower)) {
-			delete props[key];
-			continue;
-		}
+		// ALLOWLIST GATE — drop anything not explicitly admitted.
+		if (!safeAttrs.has(lower)) continue;
 
-		// URL value sanitization for allowlisted URL-bearing attrs.
-		// Case-INSENSITIVE: `<a HREF="javascript:…">` survives the
-		// allowlist via the lowercased lookup, then the value gate
-		// blocks the unsafe scheme. If the value is unsafe the prop
-		// is dropped entirely; safe values are written back under the
-		// original key (so legitimate camelCase like `formAction` is
-		// preserved).
-		if (URL_ATTRS.has(lower)) {
-			const sanitized = value == null ? value : sanitizeUrl(value, lower);
-			if (sanitized == null) {
-				delete props[key];
-			} else {
-				props[key] = sanitized;
+		// URL value sanitization. Multi-URL attrs (`ping`, `srcset`)
+		// route through a list-aware sanitizer; everything else uses
+		// the single-value path.
+		if (lower === 'ping' || lower === 'srcset') {
+			if (value == null) {
+				out[key] = value;
+				continue;
 			}
+			const sanitized = sanitizeUrlList(value, lower);
+			if (sanitized != null) out[key] = sanitized;
+			continue;
 		}
+		if (URL_ATTRS.has(lower)) {
+			if (value == null) {
+				out[key] = value;
+				continue;
+			}
+			const sanitized = sanitizeUrl(value, lower);
+			if (sanitized != null) out[key] = sanitized;
+			continue;
+		}
+
+		// `target` (when the host opted it in via `allowedAttrs`)
+		// admits only `_self` and `_blank`. `_top` and `_parent`
+		// break out of an iframe sandbox; named windows are an open-
+		// redirect / phishing primitive. For `_blank`, force
+		// `rel="noopener noreferrer"` after the loop so
+		// `window.opener` cannot be leaked to the new tab.
+		// Default allowlist omits `target`, so this branch is
+		// dormant unless the host knowingly opted in.
+		if (lower === 'target') {
+			if (value === '_self') out[key] = value;
+			else if (value === '_blank') {
+				out[key] = value;
+				forceNoopener = true;
+			}
+			// _top / _parent / named window: drop
+			continue;
+		}
+
+		out[key] = value;
 	}
+	if (forceNoopener) {
+		// Hard-set rather than merge — preserving attacker-controlled
+		// `rel` tokens isn't worth the parsing complexity. Loses
+		// benign annotations like `rel="external"` on `_blank` links
+		// inside a confined subtree; acceptable trade-off.
+		out.rel = 'noopener noreferrer';
+	}
+	return out;
 }
 
 const wrapped = new WeakMap();
@@ -888,7 +1106,24 @@ export function secureRender(vnode, parentDom, opts) {
 	let safeAttrs = DEFAULT_SAFE_ATTRS;
 	if (opts && opts.allowedAttrs) {
 		safeAttrs = new Set(DEFAULT_SAFE_ATTRS);
-		for (const a of opts.allowedAttrs) safeAttrs.add(String(a).toLowerCase());
+		for (const a of opts.allowedAttrs) {
+			const lower = String(a).toLowerCase();
+			// Hard-deny: a host that mechanically forwards an
+			// attacker-controlled list (CMS config, query string,
+			// etc.) trivially re-enables every CVE the allowlist was
+			// built to defuse. Refuse rather than silently accept.
+			if (isHardDeniedAttr(lower)) {
+				throw new Error(
+					'preact/secure: allowedAttrs cannot include ' +
+						JSON.stringify(a) +
+						' — event handlers, HTML-injection sinks, ' +
+						'HTMLHyperlinkElementUtils URL setters, CSP-bypass and ' +
+						'custom-element registration attributes cannot be opted in. ' +
+						'See HARD_DENY_ATTRS in preact/secure.'
+				);
+			}
+			safeAttrs.add(lower);
+		}
 	}
 	install();
 	walkSanitize(vnode, allowedTags, safeAttrs);
@@ -909,6 +1144,23 @@ export function secureRender(vnode, parentDom, opts) {
 /** Tear down a secure tree. */
 export function unmount(parentDom) {
 	preactRender(null, parentDom);
+}
+
+/**
+ * Returns true if the current synchronous frame is rendering inside
+ * a `secureRender` subtree — used by sibling addons (e.g.
+ * `preact/compartment`) to refuse to render when the host has not
+ * mounted them under `secureRender`.
+ *
+ * SECURITY: this is a fail-fast knob, not a security boundary. A
+ * `true` return only means a SecureBoundary or secure-reentry
+ * bracket is currently on the stack; it does NOT certify that the
+ * call site itself is inside that subtree. The intended caller is
+ * the render function of a sibling addon — callers Preact has
+ * already routed into the secure render flow.
+ */
+export function _isInSecureContext() {
+	return secureBoundaryDepth > 0;
 }
 
 export { h, Fragment, createElement } from 'preact';

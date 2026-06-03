@@ -588,11 +588,7 @@ describe('preact/compartment', () => {
 		expect(lastEl).to.equal(firstEl);
 	});
 
-	it('coercer alone (mounted via plain preact.render, no secureRender) still drops refs and freezes props', () => {
-		// Without secureRender, the URL-scheme / disallowed-tag / SafeEvent
-		// layer is off — but the compartment coercer still must:
-		//   - drop the attacker's ref so the DOM node never leaks
-		//   - freeze the props object the attacker sees
+	it('attacker ref via endowments.h is dropped (coercer + secure layers cooperate)', () => {
 		const seen = {};
 		const Confined = confineComponent(({ h }, props) => {
 			seen.frozen = Object.isFrozen(props);
@@ -603,17 +599,14 @@ describe('preact/compartment', () => {
 			};
 			return h('div', { ref: stealRef, class: 'attacker' }, 'x');
 		});
-		// Plain `render`, not `secureRender`. The host has decided not to
-		// use the secure layer at all.
-		render(<Confined hi="there" />, scratch);
+		secureRender(<Confined hi="there" />, scratch);
 		expect(seen.frozen).to.equal(true);
 		// The host's props sent through the wrapper do NOT include a ref
 		// even if the host hadn't passed one — the field is just absent.
 		expect(seen.ref).to.equal(undefined);
-		// The attacker's ref was dropped by the coercer (h() with the
-		// rebuilt props discards it because the coercer never read it).
+		// The attacker's ref was dropped by the coercer; defense-in-depth
+		// also strips refs via the secure layer's sanitize.
 		expect(seen.stolen).to.equal(undefined);
-		// The element rendered as a side effect of normal preact render.
 		expect(scratch.querySelector('.attacker').textContent).to.equal('x');
 	});
 
@@ -666,7 +659,13 @@ describe('preact/compartment', () => {
 
 	// Regression: coercer must drop `ref` from a HAND-BUILT vnode where
 	// the attacker put ref in `props` (not via `h()`).
-	it('drops ref from attacker hand-built vnode props (no secureRender path)', () => {
+	it('drops ref from attacker hand-built vnode props (defense-in-depth via coercer)', () => {
+		// The compartment coercer drops `ref` from any attacker prop
+		// bag at `compartment/src/index.js:DROPPED_PROPS_ALWAYS`. The
+		// secure layer's `sanitizeVNode` also nulls `vnode.ref` —
+		// either defense alone is sufficient. This test verifies the
+		// coercer-side drop by feeding a hand-built vnode (which would
+		// bypass `h()`'s normal key/ref extraction) into the system.
 		let stolen;
 		const Confined = confineComponent(() => ({
 			constructor: undefined,
@@ -678,11 +677,7 @@ describe('preact/compartment', () => {
 				children: 'x'
 			}
 		}));
-		// Use plain preact.render (no secureRender) — the coercer is the
-		// only defense in this mode. The previous code copied `ref`
-		// through `Object.keys(props)` and `h('div', rest, …)` extracted
-		// it onto vnode.ref. The fix: `coerceProps` drops `ref`.
-		render(<Confined />, scratch);
+		secureRender(<Confined />, scratch);
 		expect(stolen).to.equal(undefined);
 		expect(scratch.querySelector('div').textContent).to.equal('x');
 	});
@@ -961,5 +956,21 @@ describe('preact/compartment', () => {
 		// inherited any stale depth/exit state from the throw above.
 		secureRender(<div class="after">ok</div>, scratch);
 		expect(scratch.querySelector('.after').textContent).to.equal('ok');
+	});
+
+	// Compartment relies on `preact/secure`'s allow-by-default attr
+	// filter to block `innerHTML`, `srcdoc`, case-variant `OnError`,
+	// `javascript:` URLs, and prototype-pollution-driven sinks — the
+	// compartment-side coercer no longer mirrors any of that. A host
+	// rendering a Confined component WITHOUT `secureRender` on top
+	// would silently expose itself to all of those vectors. Refuse to
+	// render and throw a clear error instead.
+	it('Confined throws if rendered outside a secureRender tree', () => {
+		const Confined = confineComponent(({ h }) => h('div', null, 'x'));
+		// Plain preact render (no secureRender). The Confined's render
+		// function should detect this and throw.
+		expect(() => render(createElement(Confined, null), scratch)).to.throw(
+			/secureRender/
+		);
 	});
 });

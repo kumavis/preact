@@ -236,31 +236,35 @@ value, it:
 Anything that survives is built into a fresh vnode via our own `h()`;
 the attacker's original object is discarded.
 
-## Using the coercer without `secureRender`
+## Using the coercer without `secureRender` — NOT supported, throws
 
-A confined component mounted with plain `preact.render` (not
-`secureRender`) gets a meaningful subset of the protections:
+A `Confined` component mounted via plain `preact.render` (not
+`secureRender`) **throws synchronously** with a clear error message:
 
-- the attacker function is still called via `Reflect.apply(fn,
-  undefined, [endowments, props])`, so `this === undefined`;
-- the endowments bundle and the props bag are still frozen;
-- the return value is still coerced — fake vnodes, Proxies, plain
-  objects, and Promises are dropped;
-- `key` is preserved; `ref` is silently dropped because the coercer
-  never reads it.
+```
+preact/compartment: Confined components must be rendered inside a
+`secureRender` tree. Mount the host root via `secureRender(...)` from
+`preact/secure` — calling Preact `render` directly with a confined
+component is unsupported and exposes the host to HTML injection.
+```
 
-But the surrounding `preact/secure` layer is off, so the following
-are NOT in force when the host skips `secureRender`:
+This is a deliberate fail-fast. Earlier versions of this module
+silently rendered without sanitization, on the theory that the
+coercer's shape-only defenses (frozen props, dropped refs, vnode
+rebuild) were a useful belt-and-braces layer. With the allow-by-
+default attribute filter now centralized in `preact/secure`, the
+compartment-side denylist is gone — there is no longer any
+DOM-attribute defense outside `secureRender`. Rather than fail
+quietly into XSS, the wrapper refuses to render at all.
 
-- URL-scheme checks (`javascript:` URLs reach the DOM).
-- The disallowed-tag allowlist (`<script>`, `<iframe>`, etc. render).
-- `dangerouslySetInnerHTML` is not stripped.
-- Event handlers receive raw DOM `Event` objects, not `SafeEvent`.
+Detection is via `_isInSecureContext()` exported by `preact/secure`,
+which returns true only when a `SecureBoundary`-rooted subtree is
+on the current diff stack. setState-driven re-renders are handled
+correctly: the per-vnode `_parent._secureCtx` flag persists across
+the re-render so the check survives the SecureBoundary not
+re-firing.
 
 The expected mounting pattern is `secureRender(h(Confined, …), root)`.
-The standalone coercer is a useful belt-and-braces — it's how the
-compartment layer defends if, for example, a future host code path
-ever stops going through `secureRender` for some subtree.
 
 ## What's NOT in this module
 

@@ -10,7 +10,8 @@ import {
 import {
 	SecureExit,
 	_registerTrustedExitType,
-	_registerSecureReentryType
+	_registerSecureReentryType,
+	_isInSecureContext
 } from 'preact/secure';
 
 /**
@@ -246,7 +247,17 @@ function coerceType(type) {
  * `h()`.
  */
 function coerceProps(props) {
-	const rest = {};
+	// Null-prototype rest bag so Preact's `h()` — which copies into
+	// its own props bag via `for (i in props)` — cannot pick up
+	// `Object.prototype.dangerouslySetInnerHTML` (or any other
+	// host-page pollution gadget) as an inherited key on the way
+	// through. `Object.create(null)` neuters the prototype chain
+	// completely. (The secure layer's own sanitizer also null-protos
+	// its output, so this is belt-and-braces — but compartment's
+	// `h()` call happens BEFORE secure's `options.vnode` hook fires,
+	// and we don't want the polluted key to even materialize in the
+	// intermediate normalizedProps bag.)
+	const rest = Object.create(null);
 	const children = [];
 	if (props == null || typeof props !== 'object') {
 		return { rest, children };
@@ -489,6 +500,24 @@ export function confineComponent(fn, opts) {
 		opts && typeof opts.onError === 'function' ? opts.onError : null;
 
 	function Confined(rawProps) {
+		// Fail-fast: every defense in this module assumes
+		// `preact/secure`'s allow-by-default attribute filter is
+		// running on the same render. Mounting `Confined` outside a
+		// `secureRender` tree leaves attacker-returned `innerHTML`,
+		// `srcdoc`, case-variant `OnError`, `javascript:` URLs, and
+		// every prototype-pollution-driven sink unfiltered — the
+		// compartment-side coercer intentionally no longer mirrors
+		// the secure layer's deny list. Refuse to render rather than
+		// silently expose the host to XSS.
+		if (!_isInSecureContext()) {
+			throw new Error(
+				'preact/compartment: Confined components must be rendered ' +
+					'inside a `secureRender` tree. Mount the host root via ' +
+					'`secureRender(...)` from `preact/secure` — calling Preact ' +
+					'`render` directly with a confined component is unsupported ' +
+					'and exposes the host to HTML injection.'
+			);
+		}
 		// Split host children off and replace with opaque sentinels.
 		const { children: rawChildren, ...rest } = rawProps;
 		const opaqueChildren = wrapOpaqueChildren(rawChildren);

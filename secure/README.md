@@ -65,24 +65,49 @@ The renderer defends:
 3. **HTML injection and live DOM-setter abuse** — `DEFAULT_SAFE_ATTRS`
    is an **allow-by-default** attribute filter on DOM elements: any
    prop name not on the allowlist, not an `on*` handler, and not
-   `aria-*` / `data-*` is dropped. Drops by side-effect include
-   `dangerouslySetInnerHTML`, `is`, `srcdoc`, the DOM property
-   writeables (`innerHTML`, `outerHTML`, `textContent`, `innerText`,
-   `nodeValue`), the `HTMLHyperlinkElementUtils` URL-component
-   setters (`hostname`, `host`, `port`, `protocol`, `pathname`,
-   `search`, `hash`, `username`, `password`), the anchor `text`
-   setter, `attributionSrc`, `inert`, `nonce`, the `form` attribute
-   (cross-form-association attack), and anything else not enumerated.
-   Comparison is case-insensitive — case-variants like `INNERHTML` or
-   `OnError` lowercase to the same lookup key. **The structural
-   benefit:** a newly-shipped browser setter does not become
-   exploitable until the host opts in via `allowedAttrs`.
+   `aria-*` / `data-*` is dropped. The sanitizer rebuilds the prop
+   bag as a **null-prototype object**, which closes the prototype-
+   pollution path: a `Object.prototype.dangerouslySetInnerHTML = …`
+   gadget elsewhere on the host page cannot leak through Preact's
+   downstream `for (i in newProps)` iteration. Drops by side-effect
+   include `dangerouslySetInnerHTML`, `is`, `srcdoc`, the DOM
+   property writeables (`innerHTML`, `outerHTML`, `textContent`,
+   `innerText`, `nodeValue`), the `HTMLHyperlinkElementUtils` URL-
+   component setters (`hostname`, `host`, `port`, `protocol`,
+   `pathname`, `search`, `hash`, `username`, `password`), the
+   anchor `text` setter, `attributionSrc`, `inert`, `nonce`, the
+   `form` attribute (cross-form-association attack), `target` /
+   `formtarget` (iframe-sandbox escape via `_top` / `_parent`),
+   `download` (filename-spoofing phishing), and anything else not
+   enumerated. Comparison is case-insensitive — case-variants like
+   `INNERHTML` or `OnError` lowercase to the same lookup key.
+   **The structural benefit:** a newly-shipped browser setter does
+   not become exploitable until the host opts in via `allowedAttrs`.
 
-   **Customization:** `secureRender(vnode, container, { allowedAttrs:
+   **List-valued URL attrs.** `ping` (space-separated) and `srcset`
+   (comma-separated) are sanitized list-aware — every URL in the
+   list must pass the scheme gate or the whole prop is dropped.
+   The original prefix-only regex would have admitted any list
+   whose FIRST URL was safe; the list-aware path closes that exfil
+   channel.
+
+   **Customization.** `secureRender(vnode, container, { allowedAttrs:
    ['my-x', 'data-bind-id'] })` extends the default set for one
-   tree. The defaults still apply (additive). To compose multiple
-   secure trees with different allowlists, just call `secureRender`
-   per container — allowlists are stacked per boundary.
+   tree. The defaults still apply (additive). A `HARD_DENY_ATTRS`
+   set blocks opt-in for the historical attack surface: any `on*`
+   name, the empty string, `innerHTML`, `srcdoc`, the
+   `HTMLHyperlinkElementUtils` URL setters, `attributionSrc`,
+   `inert`, `nonce`, `is`, etc. — attempting to add one of these
+   throws synchronously so a config typo becomes a CI failure
+   instead of a silent XSS regression. If a host opts `target` in
+   knowingly, the renderer further restricts values to `_self` and
+   `_blank` (dropping `_top` / `_parent`) and force-sets
+   `rel="noopener noreferrer"` on `_blank` to prevent
+   `window.opener` leaks.
+
+   To compose multiple secure trees with different allowlists, just
+   call `secureRender` per container — allowlists are stacked per
+   boundary.
 4. **Dangerous element types** — tag names outside a configurable
    allowlist are replaced with `Fragment` so the offending element
    disappears while its children continue to render. The default list

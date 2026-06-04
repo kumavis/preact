@@ -146,21 +146,3 @@ export function _registerTrustedExitType(fn: Function): void;
  * branches and flip sanitization off mid-render.
  */
 export function _registerSecureReentryType(fn: Function): void;
-
-/**
- * Returns true if the current synchronous frame is rendering inside
- * a `secureRender` subtree. Sibling addons (e.g.
- * `preact/compartment`) use this as a fail-fast knob: their
- * Confined-style wrappers throw when rendered outside any secure
- * tree, refusing to render rather than silently exposing the host
- * to the attacks that the secure layer's allow-by-default attribute
- * filter would have blocked.
- *
- * SECURITY: this is a fail-fast knob, not a security boundary. A
- * `true` return only means a SecureBoundary or secure-reentry
- * bracket is currently on the stack; it does NOT certify that the
- * call site itself is inside that subtree. Intended for use from
- * the render function of a sibling addon that Preact has already
- * routed into the secure render flow.
- */
-export function _isInSecureContext(): boolean;

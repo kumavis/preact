@@ -10,8 +10,7 @@ import {
 import {
 	SecureExit,
 	_registerTrustedExitType,
-	_registerSecureReentryType,
-	_isInSecureContext
+	_registerSecureReentryType
 } from 'preact/secure';
 
 /**
@@ -315,9 +314,16 @@ function coerceProps(props) {
  * dropped, so getters never fire during the secure renderer's commit
  * phase. Used for prop values like `style` that Preact iterates and
  * reads in-place when applying to the DOM.
+ *
+ * Output bag has a NULL prototype — Preact's commit-phase
+ * `for (name in value)` on style values walks the prototype chain, so
+ * a host-page `Object.prototype.backgroundImage = 'url(attacker)'`
+ * pollution gadget would otherwise leak into the style as an
+ * inherited key. The secure layer also null-protos style at admission;
+ * this is belt-and-braces for the compartment-coercer code path.
  */
 function shallowDataCopy(obj) {
-	const out = {};
+	const out = Object.create(null);
 	let keys;
 	try {
 		keys = Object.keys(obj);
@@ -500,25 +506,14 @@ export function confineComponent(fn, opts) {
 		opts && typeof opts.onError === 'function' ? opts.onError : null;
 
 	function Confined(rawProps) {
-		// Fail-fast: every defense in this module assumes
-		// `preact/secure`'s allow-by-default attribute filter is
-		// running on the same render. Mounting `Confined` outside a
-		// `secureRender` tree leaves attacker-returned `innerHTML`,
-		// `srcdoc`, case-variant `OnError`, `javascript:` URLs, and
-		// every prototype-pollution-driven sink unfiltered — the
-		// compartment-side coercer intentionally no longer mirrors
-		// the secure layer's deny list. Refuse to render rather than
-		// silently expose the host to XSS.
-		if (!_isInSecureContext()) {
-			throw new Error(
-				'preact/compartment: Confined components must be rendered ' +
-					'inside a `secureRender` tree. Mount the host root via ' +
-					'`secureRender(...)` from `preact/secure` — calling Preact ' +
-					'`render` directly with a confined component is unsupported ' +
-					'and exposes the host to HTML injection.'
-			);
-		}
-		// Split host children off and replace with opaque sentinels.
+		// Fail-fast for the "mounted outside secureRender" case lives
+		// in `preact/secure`'s `_render` hook: the reentry branch
+		// walks `vnode._parent` for a `SecureBoundary` ancestor and
+		// throws if absent. That fires BEFORE this body runs, so any
+		// host that reaches us is guaranteed to be inside a real
+		// secure subtree (this body cannot self-certify; the ancestor
+		// walk is unforgeable because `SecureBoundary` is module-
+		// private to `preact/secure`).
 		const { children: rawChildren, ...rest } = rawProps;
 		const opaqueChildren = wrapOpaqueChildren(rawChildren);
 		const sanitizedProps = Object.freeze({

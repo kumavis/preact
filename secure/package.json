@@ -1,7 +1,6 @@
 {
   "name": "preact-secure",
   "amdName": "preactSecure",
-  "private": true,
   "description": "Secure renderer for Preact: components never see DOM nodes or raw events.",
   "main": "dist/secure.js",
   "module": "dist/secure.mjs",

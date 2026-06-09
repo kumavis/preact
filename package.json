@@ -102,13 +102,29 @@
       "import": "./compat/scheduler.mjs",
       "require": "./compat/scheduler.js"
     },
+    "./secure": {
+      "types": "./secure/src/index.d.ts",
+      "module": "./secure/dist/secure.mjs",
+      "umd": "./secure/dist/secure.umd.js",
+      "import": "./secure/dist/secure.mjs",
+      "require": "./secure/dist/secure.js"
+    },
+    "./compartment": {
+      "types": "./compartment/src/index.d.ts",
+      "module": "./compartment/dist/compartment.mjs",
+      "umd": "./compartment/dist/compartment.umd.js",
+      "import": "./compartment/dist/compartment.mjs",
+      "require": "./compartment/dist/compartment.js"
+    },
     "./package.json": "./package.json",
     "./compat/package.json": "./compat/package.json",
     "./debug/package.json": "./debug/package.json",
     "./devtools/package.json": "./devtools/package.json",
     "./hooks/package.json": "./hooks/package.json",
     "./test-utils/package.json": "./test-utils/package.json",
-    "./jsx-runtime/package.json": "./jsx-runtime/package.json"
+    "./jsx-runtime/package.json": "./jsx-runtime/package.json",
+    "./secure/package.json": "./secure/package.json",
+    "./compartment/package.json": "./compartment/package.json"
   },
   "license": "MIT",
   "funding": {
@@ -188,7 +204,13 @@
     "jsx-runtime/package.json",
     "test-utils/src",
     "test-utils/package.json",
-    "test-utils/dist"
+    "test-utils/dist",
+    "secure/dist",
+    "secure/src",
+    "secure/package.json",
+    "compartment/dist",
+    "compartment/src",
+    "compartment/package.json"
   ],
   "keywords": [
     "preact",

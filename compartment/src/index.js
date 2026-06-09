@@ -8,7 +8,6 @@ import {
 	useReducer
 } from 'preact/hooks';
 import {
-	SecureExit,
 	_registerTrustedExitType,
 	_registerSecureReentryType
 } from 'preact/secure';

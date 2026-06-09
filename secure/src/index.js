@@ -963,7 +963,17 @@ function sanitizeElementProps(props, safeAttrs) {
 	//      writing the canonical `rel`.
 	const admittedKeyByLower = Object.create(null);
 	let forceNoopener = false;
-	const keys = Object.getOwnPropertyNames(props);
+	let keys;
+	try {
+		keys = Object.getOwnPropertyNames(props);
+	} catch (_) {
+		// A hostile props bag — e.g. an attacker hand-built vnode whose
+		// `props` is a Proxy with a throwing `ownKeys` trap — must not
+		// abort the host render. Fail closed: emit an element with no
+		// attributes. Consistent with the per-key getter try/catch below
+		// that treats hostile shapes as drop-the-prop, not throw.
+		return out;
+	}
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
 		// `children` is the subtree, not a DOM attribute; preserve.
@@ -1087,7 +1097,15 @@ function sanitizeElementProps(props, safeAttrs) {
 		// version. Skipping accessors here mirrors that defense.)
 		if (lower === 'style' && value !== null && typeof value === 'object') {
 			const styleOut = Object.create(null);
-			const styleKeys = Object.getOwnPropertyNames(value);
+			let styleKeys;
+			try {
+				styleKeys = Object.getOwnPropertyNames(value);
+			} catch (_) {
+				// Hostile style object (e.g. a Proxy with a throwing
+				// `ownKeys` trap). Fail closed: treat it as an empty style
+				// bag rather than aborting the host render.
+				styleKeys = [];
+			}
 			for (let j = 0; j < styleKeys.length; j++) {
 				const sk = styleKeys[j];
 				let desc;

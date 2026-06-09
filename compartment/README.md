@@ -242,10 +242,11 @@ A `Confined` component mounted via plain `preact.render` (not
 `secureRender`) **throws synchronously** with a clear error message:
 
 ```
-preact/compartment: Confined components must be rendered inside a
-`secureRender` tree. Mount the host root via `secureRender(...)` from
-`preact/secure` — calling Preact `render` directly with a confined
-component is unsupported and exposes the host to HTML injection.
+preact/secure: a secure-reentry component (e.g. preact/compartment
+Confined) must be rendered inside a `secureRender` tree. Mount the
+host root via `secureRender(...)` from `preact/secure` — calling
+Preact `render` directly with such a component is unsupported and
+exposes the host to HTML injection.
 ```
 
 This is a deliberate fail-fast. Earlier versions of this module
@@ -257,12 +258,26 @@ compartment-side denylist is gone — there is no longer any
 DOM-attribute defense outside `secureRender`. Rather than fail
 quietly into XSS, the wrapper refuses to render at all.
 
-Detection is via `_isInSecureContext()` exported by `preact/secure`,
-which returns true only when a `SecureBoundary`-rooted subtree is
-on the current diff stack. setState-driven re-renders are handled
-correctly: the per-vnode `_parent._secureCtx` flag persists across
-the re-render so the check survives the SecureBoundary not
-re-firing.
+**How the check works.** The throw lives in `preact/secure`'s
+`options._render` hook: when a secure-reentry component (any
+`Confined`) is about to render, secure walks the vnode's `_parent`
+chain looking for a `SecureBoundary` mount. `SecureBoundary` is
+module-private to `preact/secure`, so its identity cannot be forged
+from outside — finding it proves the component is genuinely inside a
+`secureRender` subtree. The walk reads only the tree Preact itself
+built (Preact overwrites `vnode._parent` during diffing, so an
+attacker-supplied fake `_parent` is discarded), and it carries no
+global mutable state — unlike the earlier counter-based design, it
+cannot be left in a stuck "armed" state by a sibling addon that
+swallows `options._catchError` (e.g. `preact/compat` Suspense).
+
+**Arming.** Secure's option hooks (including this fail-fast) are
+installed the moment a secure-reentry or trusted-exit type is
+registered — `confineComponent` registers each `Confined` it mints,
+so simply *defining* a confined component arms the gate. You do not
+have to call `secureRender()` first for the throw to fire; a host
+that wires `confineComponent` but mounts via plain `render()` still
+gets the error rather than silent injection.
 
 The expected mounting pattern is `secureRender(h(Confined, …), root)`.
 

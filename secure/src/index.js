@@ -565,6 +565,17 @@ export function _registerSecureReentryType(fn) {
 				'trusted-exit type and a secure-reentry type.'
 		);
 	}
+	// Arm secure's option hooks NOW, at registration time. Without
+	// this, the fail-fast in `options._render` (which throws when a
+	// secure-reentry component renders outside a SecureBoundary
+	// ancestor) is dormant until the first `secureRender()` call. A
+	// host that wires `confineComponent` but mounts a `Confined` via
+	// plain `render()` — and never calls `secureRender()` — would
+	// otherwise get NO sanitization and NO error: the coerced output
+	// reaches the DOM with live `javascript:` URLs, `dangerouslySet-
+	// InnerHTML`, etc. Installing here means defining a reentry type
+	// is sufficient to arm the gate, regardless of render order.
+	install();
 	secureReentryTypes.add(fn);
 }
 
@@ -582,6 +593,11 @@ export function _registerTrustedExitType(fn) {
 				'trusted-exit type and a secure-reentry type.'
 		);
 	}
+	// Arm secure's option hooks at registration time — see the note
+	// in `_registerSecureReentryType`. Registering a trusted-exit
+	// type means the registrant intends secure's diff hooks to run;
+	// a dormant install would silently no-op them.
+	install();
 	trustedExitTypes.add(fn);
 }
 
